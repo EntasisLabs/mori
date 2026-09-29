@@ -10,7 +10,7 @@ The database is the official Locus path: `locus-surreal-adapter` opens a `surrea
 
 ```text
 .mori/
-  config.json    repo settings, including the default session
+  config.json    repo settings, the default session, and remotes
   index.json     staged context that is not stored yet
   kv/            embedded SurrealKV directory
 ```
@@ -57,7 +57,19 @@ mori merge kiln -m "bring the kiln notes back"
 mori rebase main
 ```
 
-Both refuse when context is staged. This history is local to the repo.
+Both refuse when context is staged.
+
+A remote is another SurrealDB. `ws://`, `wss://`, `http://`, and `https://` are the usual endpoints. mori opens that connection for the command and drops it, the same way it opens the local file. Context moves through the Locus sync coordinator. Commits and branch pointers move with it.
+
+`fetch` updates `origin/main` and leaves the branch you have checked out where it is. `push` sends the current branch, and refuses when the remote branch has diverged. `sync` fetches, fast-forwards when the remote is strictly ahead, then pushes.
+
+```bash
+mori remote add origin wss://memory.example/rpc
+mori fetch
+mori merge origin/main
+mori push
+mori sync
+```
 
 `--session` is a label Locus stores on the context. It is not a branch. The default session is `main`.
 

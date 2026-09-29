@@ -22,10 +22,10 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::compile::compile_context;
-use crate::repo::Repo;
+use crate::repo::{RemoteConfig, Repo};
 use crate::stage::{ContextKind, StagedContext};
 
-/// One embedded SurrealKV connection.
+/// One SurrealDB connection, either the repo's SurrealKV file or a remote.
 ///
 /// Construct it at the start of a command and drop it before the command
 /// returns. There is no resident process.
@@ -41,17 +41,43 @@ impl Memory {
         let kv_dir = repo.kv_dir();
         std::fs::create_dir_all(&kv_dir)
             .with_context(|| format!("creating {}", kv_dir.display()))?;
-        let endpoint = format!("surrealkv://{}", kv_dir.display());
         let runtime = SurrealDbRuntimeOptions {
             root_dir: repo.root.display().to_string(),
             use_remote: false,
-            endpoint: endpoint.clone(),
+            endpoint: format!("surrealkv://{}", kv_dir.display()),
             namespace: "mori".to_string(),
             database: "memory".to_string(),
         };
 
+        Self::open(runtime, None, None).await
+    }
+
+    /// Open a remote SurrealDB. `ws://`, `wss://`, `http://`, and `https://`
+    /// authenticate. `surrealkv://` opens another embedded file.
+    pub async fn connect_remote(remote: &RemoteConfig) -> Result<Self> {
+        let runtime = SurrealDbRuntimeOptions {
+            root_dir: String::new(),
+            use_remote: true,
+            endpoint: remote.endpoint.clone(),
+            namespace: remote.namespace.clone(),
+            database: remote.database.clone(),
+        };
+        Self::open(
+            runtime,
+            remote.username.as_deref(),
+            remote.password.as_deref(),
+        )
+        .await
+    }
+
+    async fn open(
+        runtime: SurrealDbRuntimeOptions,
+        user: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<Self> {
+        let endpoint = runtime.endpoint.clone();
         let client = Arc::new(
-            RuntimeSurrealDbClient::connect(&runtime, None, None)
+            RuntimeSurrealDbClient::connect(&runtime, user, password)
                 .await
                 .with_context(|| format!("connecting to {endpoint}"))?,
         );
@@ -81,6 +107,10 @@ impl Memory {
         };
         memory.ensure_branch().await?;
         Ok(memory)
+    }
+
+    pub(crate) fn node_store(&self) -> Arc<dyn NodeStore> {
+        self.store.clone() as Arc<dyn NodeStore>
     }
 
     pub fn endpoint(&self) -> &str {
@@ -502,7 +532,7 @@ impl Memory {
         Ok(rows.first().and_then(branch_from_row))
     }
 
-    async fn write_branch(&self, name: &str, commit_id: Option<&str>) -> Result<()> {
+    pub(crate) async fn write_branch(&self, name: &str, commit_id: Option<&str>) -> Result<()> {
         let name = validate_branch_name(name)?;
         let mut params = QueryParams::new();
         params.insert("mori_name".to_string(), json!(name));
@@ -548,7 +578,7 @@ impl Memory {
         Ok(visible)
     }
 
-    async fn store_commit(&self, record: &CommitRecord) -> Result<()> {
+    pub(crate) async fn store_commit(&self, record: &CommitRecord) -> Result<()> {
         let mut params = QueryParams::new();
         params.insert("mori_commit_id".to_string(), json!(record.id));
         params.insert("mori_parent".to_string(), json!(record.parent));
@@ -582,7 +612,11 @@ impl Memory {
 
     /// `ancestor` is an ancestor of `descendant` when walking every parent of
     /// `descendant` reaches it. A missing commit is an ancestor of every history.
-    async fn is_ancestor(&self, ancestor: Option<&str>, descendant: Option<&str>) -> Result<bool> {
+    pub(crate) async fn is_ancestor(
+        &self,
+        ancestor: Option<&str>,
+        descendant: Option<&str>,
+    ) -> Result<bool> {
         let Some(ancestor) = ancestor else {
             return Ok(true);
         };
@@ -623,7 +657,7 @@ impl Memory {
 
     /// Newest first. Merge parents are pushed before the first parent so the
     /// first parent is visited next, then the merged-in history.
-    async fn walk_history(
+    pub(crate) async fn walk_history(
         &self,
         start: Option<&str>,
         limit: Option<usize>,
@@ -674,7 +708,84 @@ impl Memory {
         }))
     }
 
-    async fn commit_by_id(&self, id: &str) -> Result<Option<CommitRecord>> {
+    pub(crate) async fn list_commits(&self) -> Result<Vec<CommitRecord>> {
+        let rows = self
+            .client
+            .raw_query("SELECT * FROM mori_commit;", QueryParams::new())
+            .await
+            .context("listing commits")?;
+        rows.iter().map(commit_from_row).collect()
+    }
+
+    pub(crate) async fn list_sessions(&self) -> Result<Vec<String>> {
+        let mut sessions = HashSet::new();
+        let rows = self
+            .client
+            .raw_query("SELECT session_id FROM temporal_node;", QueryParams::new())
+            .await
+            .context("listing sessions")?;
+        for row in rows {
+            if let Some(session) = optional_string(row.get("session_id")) {
+                sessions.insert(session);
+            }
+        }
+        for commit in self.list_commits().await? {
+            if !commit.session.is_empty() {
+                sessions.insert(commit.session);
+            }
+            for entry in commit.entries {
+                if !entry.session.is_empty() {
+                    sessions.insert(entry.session);
+                }
+            }
+        }
+        let mut sessions = sessions.into_iter().collect::<Vec<_>>();
+        sessions.sort();
+        Ok(sessions)
+    }
+
+    pub(crate) async fn lookup_sync_key(&self, node_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .node_identity(node_id)
+            .await?
+            .map(|identity| identity.sync_key)
+            .filter(|key| !key.is_empty()))
+    }
+
+    pub(crate) async fn lookup_node_id(
+        &self,
+        session: &str,
+        sync_key: &str,
+    ) -> Result<Option<String>> {
+        let mut params = QueryParams::new();
+        params.insert("mori_sync_key".to_string(), json!(sync_key));
+        params.insert("mori_scope".to_string(), json!(session));
+        let rows = self
+            .client
+            .raw_query(
+                "SELECT id FROM temporal_node WHERE sync_key = $mori_sync_key AND session_id = $mori_scope LIMIT 1;",
+                params,
+            )
+            .await
+            .context("looking up synced node")?;
+        if let Some(id) = rows.first().and_then(|row| plain_record_id(row.get("id"))) {
+            return Ok(Some(id));
+        }
+
+        let mut params = QueryParams::new();
+        params.insert("mori_sync_key".to_string(), json!(sync_key));
+        let rows = self
+            .client
+            .raw_query(
+                "SELECT id FROM temporal_node WHERE sync_key = $mori_sync_key LIMIT 1;",
+                params,
+            )
+            .await
+            .context("looking up synced node")?;
+        Ok(rows.first().and_then(|row| plain_record_id(row.get("id"))))
+    }
+
+    pub(crate) async fn commit_by_id(&self, id: &str) -> Result<Option<CommitRecord>> {
         let rows = self
             .client
             .raw_query(
@@ -737,11 +848,37 @@ fn validate_branch_name(name: &str) -> Result<&str> {
     let Some(first) = chars.next() else {
         bail!("branch name cannot be empty");
     };
-    let rest_ok = chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-');
-    if name.len() > 64 || !first.is_ascii_alphanumeric() || !rest_ok {
-        bail!("branch names use letters, digits, '.', '_' and '-'");
+    let rest_ok = chars
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' || ch == '/');
+    if name.len() > 160
+        || !first.is_ascii_alphanumeric()
+        || !rest_ok
+        || name.contains("//")
+        || name.ends_with('/')
+    {
+        bail!("branch names use letters, digits, '.', '_', '-' and '/'");
     }
     Ok(name)
+}
+
+fn plain_record_id(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    let text = match value {
+        Value::String(text) => text.clone(),
+        Value::Object(map) => {
+            let nested = map.get("id").or_else(|| map.get("Id"))?;
+            return plain_record_id(Some(nested));
+        }
+        _ => return None,
+    };
+    let text = text.trim().trim_matches('`');
+    let text = text.rsplit(':').next().unwrap_or(text);
+    let text = text.trim_matches(|ch| ch == '⟨' || ch == '⟩' || ch == '〈' || ch == '〉');
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
 }
 
 fn sanitize_node_id(node_id: &str) -> Result<String> {
