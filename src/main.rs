@@ -5,8 +5,10 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use mori::{
-    compile_context, detect_kind, find_repo, init_repo, read_source, ContextKind, Memory,
-    MergeOutcome, RebaseOutcome, Repo, StageIndex, StagedContext, Stash,
+    compile_context, detect_kind, fetch_remote, find_repo, init_repo, push_remote, read_source,
+    sync_remote, validate_remote_endpoint, validate_remote_name, ContextKind, FetchReport, Memory,
+    MergeOutcome, PushOutcome, PushReport, RebaseOutcome, RemoteConfig, Repo, RepoConfig,
+    StageIndex, StagedContext, Stash, SyncReport,
 };
 use uuid::Uuid;
 
@@ -90,6 +92,26 @@ enum Command {
         /// Branch to replay onto. That branch is left where it is.
         onto: String,
     },
+    /// List remotes, or add one with `remote add`.
+    Remote {
+        #[command(subcommand)]
+        action: Option<RemoteCommand>,
+    },
+    /// Copy another SurrealDB's context into remote-tracking branches.
+    Fetch {
+        /// Remote name. Defaults to `origin`.
+        remote: Option<String>,
+    },
+    /// Send the current branch to a remote SurrealDB.
+    Push {
+        /// Remote name. Defaults to `origin`.
+        remote: Option<String>,
+    },
+    /// Fetch, fast-forward when the remote is ahead, then push.
+    Sync {
+        /// Remote name. Defaults to `origin`.
+        remote: Option<String>,
+    },
     /// Park staged context so you can check out another branch.
     Stash {
         /// Message recorded on the stash. Used when parking context.
@@ -147,6 +169,25 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum RemoteCommand {
+    /// Remember a SurrealDB endpoint. `ws://`, `wss://`, `http://`, and `https://`.
+    Add {
+        name: String,
+        endpoint: String,
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long)]
+        password: Option<String>,
+        /// SurrealDB namespace. Defaults to `mori`.
+        #[arg(long)]
+        namespace: Option<String>,
+        /// SurrealDB database. Defaults to `memory`.
+        #[arg(long)]
+        database: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum StashCommand {
     /// Show parked context, newest first.
     List,
@@ -181,6 +222,10 @@ async fn run() -> Result<()> {
         Command::Checkout { name, branch } => cmd_checkout(&name, branch).await,
         Command::Merge { branch, message } => cmd_merge(&branch, message.as_deref()).await,
         Command::Rebase { onto } => cmd_rebase(&onto).await,
+        Command::Remote { action } => cmd_remote(action),
+        Command::Fetch { remote } => cmd_fetch(remote.as_deref()).await,
+        Command::Push { remote } => cmd_push(remote.as_deref()).await,
+        Command::Sync { remote } => cmd_sync(remote.as_deref()).await,
         Command::Stash { message, action } => cmd_stash(message, action).await,
         Command::Compile {
             sources,
@@ -257,6 +302,10 @@ async fn cmd_status() -> Result<()> {
     let config = repo.load_config()?;
     let index = StageIndex::load(&repo)?;
     println!("session {}", config.default_session);
+    if !config.remotes.is_empty() {
+        let names = config.remotes.keys().cloned().collect::<Vec<_>>().join(" ");
+        println!("remotes {names}");
+    }
 
     if repo.kv_dir().exists() {
         let memory = Memory::connect(&repo).await?;
@@ -561,6 +610,174 @@ async fn cmd_rebase(onto: &str) -> Result<()> {
             }
             println!("HEAD {}", short(&tip));
         }
+    }
+    Ok(())
+}
+
+fn cmd_remote(action: Option<RemoteCommand>) -> Result<()> {
+    match action {
+        Some(RemoteCommand::Add {
+            name,
+            endpoint,
+            user,
+            password,
+            namespace,
+            database,
+        }) => cmd_remote_add(&name, &endpoint, user, password, namespace, database),
+        None => cmd_remote_list(),
+    }
+}
+
+fn cmd_remote_list() -> Result<()> {
+    let repo = repo_from_cwd()?;
+    let config = repo.load_config()?;
+    if config.remotes.is_empty() {
+        println!("no remotes");
+        return Ok(());
+    }
+    for (name, remote) in &config.remotes {
+        println!("{name} {}", remote.endpoint);
+    }
+    Ok(())
+}
+
+fn cmd_remote_add(
+    name: &str,
+    endpoint: &str,
+    user: Option<String>,
+    password: Option<String>,
+    namespace: Option<String>,
+    database: Option<String>,
+) -> Result<()> {
+    let name = validate_remote_name(name)?.to_string();
+    let endpoint = validate_remote_endpoint(endpoint)?.to_string();
+    let repo = repo_from_cwd()?;
+    let mut config = repo.load_config()?;
+    if config.remotes.contains_key(&name) {
+        bail!("remote '{name}' already exists");
+    }
+    let namespace = namespace.unwrap_or_else(|| "mori".to_string());
+    let database = database.unwrap_or_else(|| "memory".to_string());
+    if namespace.trim().is_empty() || database.trim().is_empty() {
+        bail!("namespace and database cannot be empty");
+    }
+    config.remotes.insert(
+        name.clone(),
+        RemoteConfig {
+            endpoint: endpoint.clone(),
+            namespace,
+            database,
+            username: user.filter(|value| !value.trim().is_empty()),
+            password: password.filter(|value| !value.trim().is_empty()),
+        },
+    );
+    repo.save_config(&config)?;
+    println!("remote {name} {endpoint}");
+    Ok(())
+}
+
+async fn cmd_fetch(remote: Option<&str>) -> Result<()> {
+    let (local, remote_memory, name, _repo_id) = open_remote(remote).await?;
+    let report = fetch_remote(&local, &remote_memory, &name).await?;
+    remote_memory.disconnect();
+    local.disconnect();
+    print_fetch(&report);
+    Ok(())
+}
+
+async fn cmd_push(remote: Option<&str>) -> Result<()> {
+    let (local, remote_memory, name, repo_id) = open_remote(remote).await?;
+    let report = push_remote(&local, &remote_memory, &name, &repo_id).await?;
+    remote_memory.disconnect();
+    local.disconnect();
+    print_push(&report);
+    Ok(())
+}
+
+async fn cmd_sync(remote: Option<&str>) -> Result<()> {
+    let (local, remote_memory, name, repo_id) = open_remote(remote).await?;
+    let report = sync_remote(&local, &remote_memory, &name, &repo_id).await?;
+    remote_memory.disconnect();
+    local.disconnect();
+    print_sync(&report)?;
+    Ok(())
+}
+
+async fn open_remote(name: Option<&str>) -> Result<(Memory, Memory, String, String)> {
+    let repo = repo_from_cwd()?;
+    let config = repo.load_config()?;
+    let (name, remote) = resolve_remote(&config, name)?;
+    let repo_id = repo.ensure_repo_id()?;
+    let local = Memory::connect(&repo).await?;
+    let remote_memory = match Memory::connect_remote(remote).await {
+        Ok(memory) => memory,
+        Err(err) => {
+            local.disconnect();
+            return Err(err);
+        }
+    };
+    Ok((local, remote_memory, name, repo_id))
+}
+
+fn resolve_remote<'a>(
+    config: &'a RepoConfig,
+    name: Option<&str>,
+) -> Result<(String, &'a RemoteConfig)> {
+    let name = name.unwrap_or("origin");
+    let remote = config.remotes.get(name).ok_or_else(|| {
+        anyhow::anyhow!("no remote named {name}. Add one with `mori remote add {name} <endpoint>`")
+    })?;
+    Ok((name.to_string(), remote))
+}
+
+fn print_fetch(report: &FetchReport) {
+    println!("fetched {}", report.remote);
+    println!(
+        "nodes: {} fetched, {} created, {} updated",
+        report.fetched, report.created, report.updated
+    );
+    println!("commits: {}", report.commits);
+    for (name, tip) in &report.branches {
+        match tip {
+            Some(id) => println!("  {name} {}", short(id)),
+            None => println!("  {name}"),
+        }
+    }
+}
+
+fn print_push(report: &PushReport) {
+    println!("pushed {}", report.remote);
+    println!(
+        "nodes: {} fetched, {} created, {} updated",
+        report.fetched, report.created, report.updated
+    );
+    println!("commits: {}", report.commits);
+    match &report.outcome {
+        PushOutcome::UpToDate => println!("{} already up to date", report.branch),
+        PushOutcome::FastForward { commit_id } => {
+            println!("{} fast-forward to {}", report.branch, short(commit_id));
+        }
+        PushOutcome::Created { commit_id } => {
+            println!("{} created at {}", report.branch, short(commit_id));
+        }
+    }
+}
+
+fn print_sync(report: &SyncReport) -> Result<()> {
+    print_fetch(&report.fetch);
+    if let Some(commit_id) = &report.fast_forwarded_to {
+        println!("fast-forward to {}", short(commit_id));
+    }
+    if report.diverged {
+        bail!(
+            "{} has diverged; merge {}/{} before pushing",
+            report.branch,
+            report.fetch.remote,
+            report.branch
+        );
+    }
+    if let Some(push) = &report.push {
+        print_push(push);
     }
     Ok(())
 }

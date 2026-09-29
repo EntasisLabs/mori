@@ -397,3 +397,140 @@ fn rebase_replays_onto_main_without_moving_main() {
     let same = String::from_utf8(same.stdout).unwrap();
     assert!(same.contains("already up to date"), "{same}");
 }
+
+fn kv_endpoint(dir: &std::path::Path) -> String {
+    format!("surrealkv://{}", dir.join(".mori").join("kv").display())
+}
+
+#[test]
+fn fetch_leaves_main_and_push_sends_the_branch() {
+    let origin = tempdir().unwrap();
+    let local = tempdir().unwrap();
+    assert_ok(&mori(origin.path(), &["init"]));
+    assert_ok(&mori(local.path(), &["init"]));
+
+    let missing = mori(local.path(), &["fetch"]);
+    assert!(!missing.status.success());
+    let missing = String::from_utf8(missing.stderr).unwrap();
+    assert!(missing.contains("remote"), "{missing}");
+
+    fs::write(origin.path().join("kiln.md"), "the kiln runs hot at dusk\n").unwrap();
+    assert_ok(&mori(origin.path(), &["add", "kiln.md"]));
+    assert_ok(&mori(origin.path(), &["commit", "-m", "note the kiln"]));
+
+    let endpoint = kv_endpoint(origin.path());
+    assert_ok(&mori(
+        local.path(),
+        &["remote", "add", "origin", endpoint.as_str()],
+    ));
+
+    let fetched = mori(local.path(), &["fetch"]);
+    assert_ok(&fetched);
+    let fetched = String::from_utf8(fetched.stdout).unwrap();
+    assert!(fetched.contains("origin/main"), "{fetched}");
+
+    let hidden = mori(local.path(), &["recall", "kiln dusk"]);
+    assert_ok(&hidden);
+    let hidden = String::from_utf8(hidden.stdout).unwrap();
+    assert!(hidden.contains("nothing recalled"), "{hidden}");
+
+    assert_ok(&mori(local.path(), &["checkout", "origin/main"]));
+    let seen = mori(local.path(), &["recall", "kiln dusk"]);
+    assert_ok(&seen);
+    let seen = String::from_utf8(seen.stdout).unwrap();
+    assert!(seen.contains("kiln"), "{seen}");
+
+    assert_ok(&mori(local.path(), &["checkout", "main"]));
+    assert_ok(&mori(local.path(), &["merge", "origin/main"]));
+    fs::write(
+        local.path().join("shed.md"),
+        "the shed door sticks after rain\n",
+    )
+    .unwrap();
+    assert_ok(&mori(local.path(), &["add", "shed.md"]));
+    assert_ok(&mori(local.path(), &["commit", "-m", "note the shed"]));
+
+    let pushed = mori(local.path(), &["push"]);
+    assert_ok(&pushed);
+    let pushed = String::from_utf8(pushed.stdout).unwrap();
+    assert!(
+        pushed.contains("fast-forward") || pushed.contains("created"),
+        "{pushed}"
+    );
+
+    let shed = mori(origin.path(), &["recall", "shed door"]);
+    assert_ok(&shed);
+    let shed = String::from_utf8(shed.stdout).unwrap();
+    assert!(shed.contains("shed"), "{shed}");
+
+    let kiln = mori(origin.path(), &["recall", "kiln dusk"]);
+    assert_ok(&kiln);
+    let kiln = String::from_utf8(kiln.stdout).unwrap();
+    assert!(kiln.contains("kiln"), "{kiln}");
+}
+
+#[test]
+fn sync_fast_forwards_and_a_diverged_push_waits_for_merge() {
+    let origin = tempdir().unwrap();
+    let local = tempdir().unwrap();
+    assert_ok(&mori(origin.path(), &["init"]));
+    assert_ok(&mori(local.path(), &["init"]));
+    fs::write(
+        origin.path().join("orchard.md"),
+        "the orchard plan waits on the north fence\n",
+    )
+    .unwrap();
+    assert_ok(&mori(origin.path(), &["add", "orchard.md"]));
+    assert_ok(&mori(
+        origin.path(),
+        &["commit", "-m", "remember the orchard"],
+    ));
+
+    let endpoint = kv_endpoint(origin.path());
+    assert_ok(&mori(
+        local.path(),
+        &["remote", "add", "origin", endpoint.as_str()],
+    ));
+
+    let synced = mori(local.path(), &["sync"]);
+    assert_ok(&synced);
+    let synced = String::from_utf8(synced.stdout).unwrap();
+    assert!(synced.contains("fast-forward"), "{synced}");
+
+    let orchard = mori(local.path(), &["recall", "orchard plan"]);
+    assert_ok(&orchard);
+    let orchard = String::from_utf8(orchard.stdout).unwrap();
+    assert!(orchard.contains("orchard"), "{orchard}");
+
+    fs::write(
+        local.path().join("shed.md"),
+        "the shed door sticks after rain\n",
+    )
+    .unwrap();
+    assert_ok(&mori(local.path(), &["add", "shed.md"]));
+    assert_ok(&mori(local.path(), &["commit", "-m", "note the shed"]));
+
+    fs::write(origin.path().join("kiln.md"), "the kiln runs hot at dusk\n").unwrap();
+    assert_ok(&mori(origin.path(), &["add", "kiln.md"]));
+    assert_ok(&mori(origin.path(), &["commit", "-m", "note the kiln"]));
+
+    let rejected = mori(local.path(), &["push"]);
+    assert!(!rejected.status.success());
+    let rejected = String::from_utf8(rejected.stderr).unwrap();
+    assert!(rejected.contains("diverged"), "{rejected}");
+
+    assert_ok(&mori(local.path(), &["fetch"]));
+    assert_ok(&mori(local.path(), &["merge", "origin/main"]));
+    let pushed = mori(local.path(), &["push"]);
+    assert_ok(&pushed);
+
+    let shed = mori(origin.path(), &["recall", "shed door"]);
+    assert_ok(&shed);
+    let shed = String::from_utf8(shed.stdout).unwrap();
+    assert!(shed.contains("shed"), "{shed}");
+
+    let kiln = mori(origin.path(), &["recall", "kiln dusk"]);
+    assert_ok(&kiln);
+    let kiln = String::from_utf8(kiln.stdout).unwrap();
+    assert!(kiln.contains("kiln"), "{kiln}");
+}
