@@ -121,6 +121,10 @@ impl StageIndex {
         self.entries.clear();
     }
 
+    pub fn replace(&mut self, entries: Vec<StagedContext>) {
+        self.entries = entries;
+    }
+
     pub fn unstage(&mut self, source: &str) -> bool {
         let before = self.entries.len();
         self.entries.retain(|entry| entry.source != source);

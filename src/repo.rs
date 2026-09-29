@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub const REPO_DIR: &str = ".mori";
 const CONFIG_FILE: &str = "config.json";
 const INDEX_FILE: &str = "index.json";
+const STASH_FILE: &str = "stash.json";
 const KV_DIR: &str = "kv";
 
 #[derive(Debug, Clone)]
@@ -26,6 +27,10 @@ impl Repo {
 
     pub fn index_path(&self) -> PathBuf {
         self.mori_dir().join(INDEX_FILE)
+    }
+
+    pub fn stash_path(&self) -> PathBuf {
+        self.mori_dir().join(STASH_FILE)
     }
 
     /// Directory SurrealKV owns. The adapter opens `surrealkv://<this path>`.

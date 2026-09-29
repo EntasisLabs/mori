@@ -6,7 +6,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use mori::{
     compile_context, detect_kind, find_repo, init_repo, read_source, ContextKind, Memory, Repo,
-    StageIndex, StagedContext,
+    StageIndex, StagedContext, Stash,
 };
 use uuid::Uuid;
 
@@ -51,7 +51,7 @@ enum Command {
     Init {
         /// Directory to initialize. Defaults to the current directory.
         path: Option<PathBuf>,
-        /// Default session name, like a branch you always start on.
+        /// Default Locus session label stored on new context.
         #[arg(long, default_value = "main")]
         session: String,
     },
@@ -64,8 +64,28 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
-    /// Show the session, HEAD, and staged context.
+    /// Show the branch, HEAD, staged context, and stash.
     Status,
+    /// List branches, or create one at the current tip.
+    Branch {
+        /// New branch name. Omit it to list branches.
+        name: Option<String>,
+    },
+    /// Check out a branch. Refuses when context is staged.
+    Checkout {
+        name: String,
+        /// Create the branch at the current tip, then check it out.
+        #[arg(short = 'b')]
+        branch: bool,
+    },
+    /// Park staged context so you can check out another branch.
+    Stash {
+        /// Message recorded on the stash. Used when parking context.
+        #[arg(short, long)]
+        message: Option<String>,
+        #[command(subcommand)]
+        action: Option<StashCommand>,
+    },
     /// Compile context into STTP and print it. Does not open the database.
     Compile {
         /// Files to compile. With no paths, compile whatever is staged.
@@ -114,6 +134,16 @@ enum Command {
     Reset { sources: Vec<String> },
 }
 
+#[derive(Subcommand)]
+enum StashCommand {
+    /// Show parked context, newest first.
+    List,
+    /// Restore the newest stash onto an empty index.
+    Pop,
+    /// Drop the newest stash.
+    Drop,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -135,6 +165,9 @@ async fn run() -> Result<()> {
             session,
         } => cmd_add(sources, kind.into(), session),
         Command::Status => cmd_status().await,
+        Command::Branch { name } => cmd_branch(name).await,
+        Command::Checkout { name, branch } => cmd_checkout(&name, branch).await,
+        Command::Stash { message, action } => cmd_stash(message, action).await,
         Command::Compile {
             sources,
             kind,
@@ -168,6 +201,7 @@ async fn cmd_init(path: Option<PathBuf>, session: &str) -> Result<()> {
         "initialized empty mori repository in {}",
         repo.mori_dir().display()
     );
+    println!("branch main");
     println!("session {session}");
     println!("store {endpoint}");
     Ok(())
@@ -212,13 +246,29 @@ async fn cmd_status() -> Result<()> {
 
     if repo.kv_dir().exists() {
         let memory = Memory::connect(&repo).await?;
+        let branch = memory.current_branch().await?;
+        println!("On branch {branch}");
         match memory.head().await? {
             Some(head) => println!("HEAD {} {}", short(&head.id), head.message),
             None => println!("HEAD (no commits yet)"),
         }
         memory.disconnect();
     } else {
+        println!("On branch main");
         println!("HEAD (no commits yet)");
+    }
+
+    let stash = Stash::load(&repo)?;
+    if !stash.is_empty() {
+        println!(
+            "stash: {} {}",
+            stash.entries().len(),
+            if stash.entries().len() == 1 {
+                "entry"
+            } else {
+                "entries"
+            }
+        );
     }
 
     if index.is_empty() {
@@ -290,6 +340,7 @@ async fn cmd_commit(message: &str) -> Result<()> {
         bail!("nothing staged");
     }
     let memory = Memory::connect(&repo).await?;
+    let branch = memory.current_branch().await?;
     let record = memory
         .commit(message, &config.default_session, index.entries())
         .await?;
@@ -299,12 +350,7 @@ async fn cmd_commit(message: &str) -> Result<()> {
     cleared.clear();
     cleared.save(&repo)?;
 
-    println!(
-        "[{} {}] {}",
-        record.session,
-        short(&record.id),
-        record.message
-    );
+    println!("[{} {}] {}", branch, short(&record.id), record.message);
     println!(" {} context stored", record.entries.len());
     for entry in &record.entries {
         println!("  {} {}", entry.kind.as_str(), entry.source);
@@ -315,8 +361,10 @@ async fn cmd_commit(message: &str) -> Result<()> {
 async fn cmd_log(limit: usize) -> Result<()> {
     let repo = repo_from_cwd()?;
     let memory = Memory::connect(&repo).await?;
+    let branch = memory.current_branch().await?;
     let records = memory.log(limit).await?;
     memory.disconnect();
+    println!("branch {branch}");
     if records.is_empty() {
         println!("no commits yet");
         return Ok(());
@@ -397,6 +445,132 @@ async fn cmd_find(session: Option<&str>, contains: Option<&str>, limit: usize) -
     for hit in hits {
         println!("{}", hit.summary);
     }
+    Ok(())
+}
+
+async fn cmd_branch(name: Option<String>) -> Result<()> {
+    let repo = repo_from_cwd()?;
+    let memory = Memory::connect(&repo).await?;
+    if let Some(name) = name {
+        let created = memory.create_branch(&name).await?;
+        memory.disconnect();
+        println!("created branch {created}");
+        return Ok(());
+    }
+
+    let branches = memory.branches().await?;
+    memory.disconnect();
+    if branches.is_empty() {
+        println!("no branches yet");
+        return Ok(());
+    }
+    for branch in branches {
+        let marker = if branch.current { "*" } else { " " };
+        match branch.commit_id.as_deref() {
+            Some(id) => println!("{marker} {} {}", branch.name, short(id)),
+            None => println!("{marker} {}", branch.name),
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_checkout(name: &str, create: bool) -> Result<()> {
+    let repo = repo_from_cwd()?;
+    let index = StageIndex::load(&repo)?;
+    let memory = Memory::connect(&repo).await?;
+    let current = memory.current_branch().await?;
+    if current != name && !index.is_empty() {
+        bail!(
+            "staged context is in the way; stash or commit it before checking out another branch"
+        );
+    }
+    if create {
+        memory.create_branch(name).await?;
+    }
+    memory.checkout_branch(name).await?;
+    memory.disconnect();
+    if create {
+        println!("checked out new branch {name}");
+    } else {
+        println!("checked out branch {name}");
+    }
+    Ok(())
+}
+
+async fn cmd_stash(message: Option<String>, action: Option<StashCommand>) -> Result<()> {
+    match action {
+        Some(StashCommand::List) => cmd_stash_list(),
+        Some(StashCommand::Pop) => cmd_stash_pop(),
+        Some(StashCommand::Drop) => cmd_stash_drop(),
+        None => cmd_stash_push(message.as_deref()).await,
+    }
+}
+
+async fn cmd_stash_push(message: Option<&str>) -> Result<()> {
+    let repo = repo_from_cwd()?;
+    let mut index = StageIndex::load(&repo)?;
+    if index.is_empty() {
+        bail!("nothing staged");
+    }
+    let memory = Memory::connect(&repo).await?;
+    let branch = memory.current_branch().await?;
+    memory.disconnect();
+
+    let mut stash = Stash::load(&repo)?;
+    let entry = stash
+        .push(&branch, message.unwrap_or(""), index.entries().to_vec())
+        .clone();
+    stash.save(&repo)?;
+    index.clear();
+    index.save(&repo)?;
+    println!("stashed {}: {}", short(&entry.id), entry.message);
+    Ok(())
+}
+
+fn cmd_stash_list() -> Result<()> {
+    let repo = repo_from_cwd()?;
+    let stash = Stash::load(&repo)?;
+    if stash.is_empty() {
+        println!("nothing stashed");
+        return Ok(());
+    }
+    for entry in stash.entries() {
+        println!(
+            "stash {}: {} (branch {})",
+            short(&entry.id),
+            entry.message,
+            entry.branch
+        );
+    }
+    Ok(())
+}
+
+fn cmd_stash_pop() -> Result<()> {
+    let repo = repo_from_cwd()?;
+    let mut index = StageIndex::load(&repo)?;
+    if !index.is_empty() {
+        bail!("staged context is in the way; commit, reset, or stash it before popping");
+    }
+    let mut stash = Stash::load(&repo)?;
+    let entry = stash.pop()?;
+    index.replace(entry.entries);
+    index.save(&repo)?;
+    stash.save(&repo)?;
+    println!(
+        "restored stash {}: {} (branch {})",
+        short(&entry.id),
+        entry.message,
+        entry.branch
+    );
+    Ok(())
+}
+
+fn cmd_stash_drop() -> Result<()> {
+    let repo = repo_from_cwd()?;
+    let mut stash = Stash::load(&repo)?;
+    let entry = stash.pop()?;
+    stash.save(&repo)?;
+    println!("dropped stash {}: {}", short(&entry.id), entry.message);
     Ok(())
 }
 

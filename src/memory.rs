@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -65,18 +66,21 @@ impl Memory {
         client
             .raw_query(
                 "DEFINE TABLE IF NOT EXISTS mori_commit SCHEMALESS;
-                 DEFINE TABLE IF NOT EXISTS mori_ref SCHEMALESS;",
+                 DEFINE TABLE IF NOT EXISTS mori_ref SCHEMALESS;
+                 DEFINE TABLE IF NOT EXISTS mori_branch SCHEMALESS;",
                 QueryParams::new(),
             )
             .await
             .context("preparing mori commit tables")?;
 
-        Ok(Self {
+        let memory = Self {
             client,
             store,
             index,
             endpoint,
-        })
+        };
+        memory.ensure_branch().await?;
+        Ok(memory)
     }
 
     pub fn endpoint(&self) -> &str {
@@ -131,7 +135,8 @@ impl Memory {
             });
         }
 
-        let parent = self.head_id().await?;
+        let branch = self.current_branch().await?;
+        let parent = self.branch_tip(&branch).await?;
         let record = CommitRecord {
             id: Uuid::new_v4().simple().to_string(),
             parent,
@@ -166,35 +171,87 @@ impl Memory {
             .await
             .context("writing commit")?;
 
-        let mut head_params = QueryParams::new();
-        head_params.insert("mori_commit_id".to_string(), json!(record.id));
-        self.client
-            .raw_query(
-                "UPSERT mori_ref:HEAD SET commit_id = $mori_commit_id;",
-                head_params,
-            )
-            .await
-            .context("updating HEAD")?;
-
+        self.write_branch(&branch, Some(&record.id)).await?;
         Ok(record)
     }
 
+    pub async fn current_branch(&self) -> Result<String> {
+        let row = self
+            .read_head()
+            .await?
+            .ok_or_else(|| anyhow!("HEAD is missing"))?;
+        row.get("branch")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("HEAD does not name a branch"))
+    }
+
+    pub async fn branches(&self) -> Result<Vec<BranchInfo>> {
+        let current = self.current_branch().await?;
+        let rows = self
+            .client
+            .raw_query("SELECT * FROM mori_branch;", QueryParams::new())
+            .await
+            .context("listing branches")?;
+        let mut branches = rows
+            .iter()
+            .filter_map(|row| branch_from_row(row))
+            .map(|row| BranchInfo {
+                current: row.name == current,
+                name: row.name,
+                commit_id: row.commit_id,
+            })
+            .collect::<Vec<_>>();
+        branches.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(branches)
+    }
+
+    /// Point a new branch at the current tip. The current branch stays checked out.
+    pub async fn create_branch(&self, name: &str) -> Result<String> {
+        let name = validate_branch_name(name)?;
+        if self.read_branch(name).await?.is_some() {
+            bail!("branch '{name}' already exists");
+        }
+        let tip = self.branch_tip(&self.current_branch().await?).await?;
+        self.write_branch(name, tip.as_deref()).await?;
+        Ok(name.to_string())
+    }
+
+    pub async fn checkout_branch(&self, name: &str) -> Result<String> {
+        let name = validate_branch_name(name)?;
+        if self.read_branch(name).await?.is_none() {
+            bail!("branch '{name}' does not exist");
+        }
+        self.set_head_branch(name).await?;
+        Ok(name.to_string())
+    }
+
+    pub async fn branch_tip(&self, name: &str) -> Result<Option<String>> {
+        let name = validate_branch_name(name)?;
+        let Some(row) = self.read_branch(name).await? else {
+            bail!("branch '{name}' does not exist");
+        };
+        Ok(row.commit_id)
+    }
+
     pub async fn head(&self) -> Result<Option<CommitRecord>> {
-        let Some(id) = self.head_id().await? else {
+        let Some(id) = self.branch_tip(&self.current_branch().await?).await? else {
             return Ok(None);
         };
         self.commit_by_id(&id).await
     }
 
     pub async fn log(&self, limit: usize) -> Result<Vec<CommitRecord>> {
-        let Some(head) = self.head_id().await? else {
+        let Some(head) = self.branch_tip(&self.current_branch().await?).await? else {
             return Ok(Vec::new());
         };
         let mut records = Vec::new();
+        let mut seen = HashSet::new();
         let mut cursor = Some(head);
         let limit = limit.max(1);
         while let Some(id) = cursor {
-            if records.len() >= limit {
+            if records.len() >= limit || !seen.insert(id.clone()) {
                 break;
             }
             let Some(record) = self.commit_by_id(&id).await? else {
@@ -229,13 +286,7 @@ impl Memory {
     }
 
     pub async fn node_raw(&self, node_id: &str) -> Result<String> {
-        let id = node_id
-            .trim()
-            .trim_start_matches("temporal_node:")
-            .replace('`', "");
-        if id.is_empty() || id.contains(';') {
-            bail!("invalid node id");
-        }
+        let id = sanitize_node_id(node_id)?;
         let rows = self
             .client
             .raw_query(
@@ -257,13 +308,18 @@ impl Memory {
         session: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Recalled>> {
+        let visible = self.visible_nodes().await?;
+        if visible.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.max(1);
         let recall = MemoryRecallService::new(self.store.clone() as Arc<dyn NodeStore>)
             .with_semantic_index(self.index.clone() as Arc<dyn SemanticIndexStore>);
         let result = recall
             .execute(&MemoryRecallRequest {
                 scope: scope_for(session),
                 page: MemoryPage {
-                    limit: limit.max(1),
+                    limit: scan_limit(limit),
                     cursor: None,
                 },
                 scoring: MemoryScoring {
@@ -282,6 +338,8 @@ impl Memory {
         Ok(result
             .nodes
             .into_iter()
+            .filter(|node| visible.matches(node.sync_key.as_str(), node.raw.as_str()))
+            .take(limit)
             .map(|node| Recalled {
                 session: node.session_id,
                 summary: node
@@ -300,12 +358,17 @@ impl Memory {
         contains: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Recalled>> {
+        let visible = self.visible_nodes().await?;
+        if visible.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.max(1);
         let find = MemoryFindService::new(self.store.clone() as Arc<dyn NodeStore>)
             .with_semantic_index(self.index.clone() as Arc<dyn SemanticIndexStore>);
         let mut request = MemoryFindRequest {
             scope: scope_for(session),
             page: MemoryPage {
-                limit: limit.max(1),
+                limit: scan_limit(limit),
                 cursor: None,
             },
             ..MemoryFindRequest::default()
@@ -317,6 +380,8 @@ impl Memory {
         Ok(result
             .nodes
             .into_iter()
+            .filter(|node| visible.matches(node.sync_key.as_str(), node.raw.as_str()))
+            .take(limit)
             .map(|node| Recalled {
                 session: node.session_id,
                 summary: node
@@ -329,17 +394,124 @@ impl Memory {
             .collect())
     }
 
-    async fn head_id(&self) -> Result<Option<String>> {
+    async fn ensure_branch(&self) -> Result<()> {
+        let Some(row) = self.read_head().await? else {
+            self.write_branch("main", None).await?;
+            self.set_head_branch("main").await?;
+            return Ok(());
+        };
+
+        if let Some(name) = row
+            .get("branch")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        {
+            if self.read_branch(name).await?.is_none() {
+                let tip = optional_string(row.get("commit_id"));
+                self.write_branch(name, tip.as_deref()).await?;
+            }
+            return Ok(());
+        }
+
+        let tip = optional_string(row.get("commit_id"));
+        self.write_branch("main", tip.as_deref()).await?;
+        self.set_head_branch("main").await?;
+        Ok(())
+    }
+
+    async fn read_head(&self) -> Result<Option<Value>> {
         let rows = self
             .client
             .raw_query("SELECT * FROM mori_ref:HEAD;", QueryParams::new())
             .await
             .context("reading HEAD")?;
-        Ok(rows
-            .first()
-            .and_then(|row| row.get("commit_id"))
-            .and_then(Value::as_str)
-            .map(str::to_string))
+        Ok(rows.into_iter().next())
+    }
+
+    async fn read_branch(&self, name: &str) -> Result<Option<BranchRow>> {
+        let name = validate_branch_name(name)?;
+        let rows = self
+            .client
+            .raw_query(
+                &format!("SELECT * FROM mori_branch:`{name}`;"),
+                QueryParams::new(),
+            )
+            .await
+            .context("reading branch")?;
+        Ok(rows.first().and_then(branch_from_row))
+    }
+
+    async fn write_branch(&self, name: &str, commit_id: Option<&str>) -> Result<()> {
+        let name = validate_branch_name(name)?;
+        let mut params = QueryParams::new();
+        params.insert("mori_name".to_string(), json!(name));
+        params.insert("mori_commit_id".to_string(), json!(commit_id));
+        self.client
+            .raw_query(
+                &format!(
+                    "UPSERT mori_branch:`{name}` SET name = $mori_name, commit_id = $mori_commit_id;"
+                ),
+                params,
+            )
+            .await
+            .context("writing branch")?;
+        Ok(())
+    }
+
+    async fn set_head_branch(&self, name: &str) -> Result<()> {
+        let name = validate_branch_name(name)?;
+        let mut params = QueryParams::new();
+        params.insert("mori_branch".to_string(), json!(name));
+        self.client
+            .raw_query("UPSERT mori_ref:HEAD SET branch = $mori_branch;", params)
+            .await
+            .context("updating HEAD")?;
+        Ok(())
+    }
+
+    async fn visible_nodes(&self) -> Result<VisibleNodes> {
+        let mut visible = VisibleNodes::default();
+        let mut seen = HashSet::new();
+        let mut cursor = self.branch_tip(&self.current_branch().await?).await?;
+        while let Some(id) = cursor {
+            if !seen.insert(id.clone()) {
+                break;
+            }
+            let Some(record) = self.commit_by_id(&id).await? else {
+                break;
+            };
+            for entry in &record.entries {
+                if let Some(identity) = self.node_identity(&entry.node_id).await? {
+                    if !identity.sync_key.is_empty() {
+                        visible.sync_keys.insert(identity.sync_key);
+                    }
+                    if !identity.raw.is_empty() {
+                        visible.raws.insert(identity.raw);
+                    }
+                }
+            }
+            cursor = record.parent;
+        }
+        Ok(visible)
+    }
+
+    async fn node_identity(&self, node_id: &str) -> Result<Option<NodeIdentity>> {
+        let id = sanitize_node_id(node_id)?;
+        let rows = self
+            .client
+            .raw_query(
+                &format!("SELECT raw, sync_key FROM temporal_node:`{id}`;"),
+                QueryParams::new(),
+            )
+            .await
+            .context("reading stored node identity")?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        Ok(Some(NodeIdentity {
+            sync_key: optional_string(row.get("sync_key")).unwrap_or_default(),
+            raw: optional_string(row.get("raw")).unwrap_or_default(),
+        }))
     }
 
     async fn commit_by_id(&self, id: &str) -> Result<Option<CommitRecord>> {
@@ -356,6 +528,96 @@ impl Memory {
             None => Ok(None),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct BranchInfo {
+    pub name: String,
+    pub commit_id: Option<String>,
+    pub current: bool,
+}
+
+struct BranchRow {
+    name: String,
+    commit_id: Option<String>,
+}
+
+#[derive(Default)]
+struct VisibleNodes {
+    sync_keys: HashSet<String>,
+    raws: HashSet<String>,
+}
+
+impl VisibleNodes {
+    fn is_empty(&self) -> bool {
+        self.sync_keys.is_empty() && self.raws.is_empty()
+    }
+
+    fn matches(&self, sync_key: &str, raw: &str) -> bool {
+        (!sync_key.is_empty() && self.sync_keys.contains(sync_key))
+            || (!raw.is_empty() && self.raws.contains(raw))
+    }
+}
+
+struct NodeIdentity {
+    sync_key: String,
+    raw: String,
+}
+
+fn scan_limit(limit: usize) -> usize {
+    limit.saturating_mul(25).clamp(64, 2000)
+}
+
+fn validate_branch_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.eq_ignore_ascii_case("head") {
+        bail!("HEAD is reserved");
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        bail!("branch name cannot be empty");
+    };
+    let rest_ok = chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-');
+    if name.len() > 64 || !first.is_ascii_alphanumeric() || !rest_ok {
+        bail!("branch names use letters, digits, '.', '_' and '-'");
+    }
+    Ok(name)
+}
+
+fn sanitize_node_id(node_id: &str) -> Result<String> {
+    let id = node_id
+        .trim()
+        .trim_start_matches("temporal_node:")
+        .replace('`', "");
+    if id.is_empty() || id.contains(';') || id.contains(' ') {
+        bail!("invalid node id");
+    }
+    Ok(id)
+}
+
+fn optional_string(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).and_then(|text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed == "null" {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn branch_from_row(row: &Value) -> Option<BranchRow> {
+    let name = optional_string(row.get("name")).or_else(|| {
+        optional_string(row.get("id")).and_then(|id| {
+            id.rsplit([':', '`'])
+                .find(|part| !part.is_empty() && *part != "mori_branch")
+                .map(str::to_string)
+        })
+    })?;
+    Some(BranchRow {
+        name,
+        commit_id: optional_string(row.get("commit_id")),
+    })
 }
 
 fn scope_for(session: Option<&str>) -> MemoryScope {
