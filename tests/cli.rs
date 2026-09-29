@@ -120,3 +120,101 @@ fn chat_and_raw_sttp_can_both_be_stored() {
     assert!(log_text.contains("save the chat"), "{log_text}");
     assert!(log_text.contains("store compiled note"), "{log_text}");
 }
+
+#[test]
+fn branches_keep_recall_on_their_own_history() {
+    let dir = tempdir().unwrap();
+    assert_ok(&mori(dir.path(), &["init"]));
+
+    fs::write(
+        dir.path().join("orchard.md"),
+        "the orchard plan waits on the north fence\n",
+    )
+    .unwrap();
+    assert_ok(&mori(dir.path(), &["add", "orchard.md"]));
+    assert_ok(&mori(dir.path(), &["commit", "-m", "remember the orchard"]));
+
+    assert_ok(&mori(dir.path(), &["switch", "-c", "kiln"]));
+    fs::write(dir.path().join("kiln.md"), "the kiln runs hot at dusk\n").unwrap();
+    assert_ok(&mori(dir.path(), &["add", "kiln.md"]));
+    assert_ok(&mori(dir.path(), &["commit", "-m", "note the kiln"]));
+
+    let on_kiln = mori(dir.path(), &["recall", "kiln dusk"]);
+    assert_ok(&on_kiln);
+    let on_kiln = String::from_utf8(on_kiln.stdout).unwrap();
+    assert!(on_kiln.contains("kiln"), "{on_kiln}");
+
+    let shared = mori(dir.path(), &["recall", "orchard plan"]);
+    assert_ok(&shared);
+    let shared = String::from_utf8(shared.stdout).unwrap();
+    assert!(shared.contains("orchard"), "{shared}");
+
+    assert_ok(&mori(dir.path(), &["switch", "main"]));
+    let hidden = mori(dir.path(), &["recall", "kiln dusk"]);
+    assert_ok(&hidden);
+    let hidden = String::from_utf8(hidden.stdout).unwrap();
+    assert!(hidden.contains("nothing recalled"), "{hidden}");
+
+    let still_there = mori(dir.path(), &["recall", "orchard plan"]);
+    assert_ok(&still_there);
+    let still_there = String::from_utf8(still_there.stdout).unwrap();
+    assert!(still_there.contains("orchard"), "{still_there}");
+
+    let found = mori(dir.path(), &["find", "--contains", "kiln"]);
+    assert_ok(&found);
+    let found = String::from_utf8(found.stdout).unwrap();
+    assert!(found.contains("nothing found"), "{found}");
+
+    let listed = mori(dir.path(), &["branch"]);
+    assert_ok(&listed);
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(listed.contains("* main"), "{listed}");
+    assert!(listed.contains("kiln"), "{listed}");
+}
+
+#[test]
+fn stash_lets_you_switch_and_come_back() {
+    let dir = tempdir().unwrap();
+    assert_ok(&mori(dir.path(), &["init"]));
+    fs::write(
+        dir.path().join("roof.md"),
+        "the unfinished copper roof needs another day\n",
+    )
+    .unwrap();
+    assert_ok(&mori(dir.path(), &["add", "roof.md"]));
+
+    let blocked = mori(dir.path(), &["switch", "-c", "other"]);
+    assert!(!blocked.status.success());
+    let blocked = String::from_utf8(blocked.stderr).unwrap();
+    assert!(blocked.contains("stash"), "{blocked}");
+
+    assert_ok(&mori(dir.path(), &["stash", "-m", "hold the roof"]));
+    let status = mori(dir.path(), &["status"]);
+    assert_ok(&status);
+    let status = String::from_utf8(status.stdout).unwrap();
+    assert!(status.contains("nothing staged"), "{status}");
+    assert!(status.contains("stash: 1 entry"), "{status}");
+
+    let listed = mori(dir.path(), &["stash", "list"]);
+    assert_ok(&listed);
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(listed.contains("hold the roof"), "{listed}");
+    assert!(listed.contains("branch main"), "{listed}");
+
+    assert_ok(&mori(dir.path(), &["switch", "-c", "other"]));
+    assert_ok(&mori(dir.path(), &["stash", "pop"]));
+    let restored = mori(dir.path(), &["status"]);
+    assert_ok(&restored);
+    let restored = String::from_utf8(restored.stdout).unwrap();
+    assert!(restored.contains("roof.md"), "{restored}");
+    assert!(restored.contains("On branch other"), "{restored}");
+
+    assert_ok(&mori(dir.path(), &["reset"]));
+    assert_ok(&mori(dir.path(), &["add", "roof.md"]));
+    assert_ok(&mori(dir.path(), &["stash"]));
+    assert_ok(&mori(dir.path(), &["stash", "drop"]));
+    let empty = mori(dir.path(), &["stash", "list"]);
+    assert_ok(&empty);
+    let empty = String::from_utf8(empty.stdout).unwrap();
+    assert!(empty.contains("nothing stashed"), "{empty}");
+}

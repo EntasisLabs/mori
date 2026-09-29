@@ -15,7 +15,7 @@ The database is the official Locus path: `locus-surreal-adapter` opens a `surrea
   kv/            embedded SurrealKV directory
 ```
 
-`add` and `compile` never open `kv/`. `init`, `commit`, `log`, `show`, `status`, `recall`, and `find` open it and disconnect before they return.
+`add` and `compile` never open `kv/`. Commands that read or write memory open it and disconnect before they return.
 
 ## Usage
 
@@ -31,13 +31,29 @@ mori recall "orchard plan"
 mori show <commit> --raw           # raw STTP is opt-in
 ```
 
-Sessions are the scope Locus stores nodes under. The default session is `main`.
+A branch is a name pointing at a commit. `log`, `recall`, and `find` follow that chain, so context committed on another branch stays out of view. Shared history stays visible on both. Nodes are not copied.
+
+```bash
+mori branch                        # list, current branch marked *
+mori switch -c kiln                # new branch at the current tip
+mori switch main                   # refuses if context is staged
+```
+
+`stash` parks the index so you can switch. `stash pop` puts it back onto an empty index.
+
+```bash
+mori stash -m "hold the kiln notes"
+mori stash list
+mori stash pop
+```
+
+`--session` is a label Locus stores on the context. It is not a branch. The default session is `main`.
 
 ```bash
 mori add design.md --session design
 ```
 
-`reset` unstages. With no paths it clears the index and leaves stored memory alone.
+`reset` unstages. With no paths it clears the index and leaves stored memory and the stash alone.
 
 ## What gets stored
 
