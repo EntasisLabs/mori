@@ -11,7 +11,7 @@ mod stage;
 mod stash;
 
 pub use compile::{compile_context, detect_kind, CompiledContext};
-pub use memory::{BranchInfo, Memory, Recalled};
+pub use memory::{BranchInfo, Memory, MergeOutcome, RebaseOutcome, Recalled};
 pub use repo::{find_repo, init_repo, Repo};
 pub use stage::{read_source, ContextKind, StageIndex, StagedContext};
 pub use stash::{Stash, StashEntry};
