@@ -218,3 +218,182 @@ fn stash_lets_you_checkout_and_come_back() {
     let empty = String::from_utf8(empty.stdout).unwrap();
     assert!(empty.contains("nothing stashed"), "{empty}");
 }
+
+#[test]
+fn merge_fast_forward_and_the_cases_that_do_nothing() {
+    let dir = tempdir().unwrap();
+    assert_ok(&mori(dir.path(), &["init"]));
+    fs::write(
+        dir.path().join("orchard.md"),
+        "the orchard plan waits on the north fence\n",
+    )
+    .unwrap();
+    assert_ok(&mori(dir.path(), &["add", "orchard.md"]));
+    assert_ok(&mori(dir.path(), &["commit", "-m", "remember the orchard"]));
+    assert_ok(&mori(dir.path(), &["checkout", "-b", "kiln"]));
+    fs::write(dir.path().join("kiln.md"), "the kiln runs hot at dusk\n").unwrap();
+    assert_ok(&mori(dir.path(), &["add", "kiln.md"]));
+    assert_ok(&mori(dir.path(), &["commit", "-m", "note the kiln"]));
+    assert_ok(&mori(dir.path(), &["checkout", "main"]));
+
+    let into_itself = mori(dir.path(), &["merge", "main"]);
+    assert!(!into_itself.status.success());
+    let into_itself = String::from_utf8(into_itself.stderr).unwrap();
+    assert!(into_itself.contains("itself"), "{into_itself}");
+
+    fs::write(dir.path().join("roof.md"), "the unfinished copper roof\n").unwrap();
+    assert_ok(&mori(dir.path(), &["add", "roof.md"]));
+    let dirty = mori(dir.path(), &["merge", "kiln"]);
+    assert!(!dirty.status.success());
+    let dirty = String::from_utf8(dirty.stderr).unwrap();
+    assert!(dirty.contains("staged"), "{dirty}");
+    assert_ok(&mori(dir.path(), &["reset"]));
+
+    let merged = mori(dir.path(), &["merge", "kiln"]);
+    assert_ok(&merged);
+    let merged = String::from_utf8(merged.stdout).unwrap();
+    assert!(merged.contains("fast-forward"), "{merged}");
+
+    let recalled = mori(dir.path(), &["recall", "kiln dusk"]);
+    assert_ok(&recalled);
+    let recalled = String::from_utf8(recalled.stdout).unwrap();
+    assert!(recalled.contains("kiln"), "{recalled}");
+
+    let again = mori(dir.path(), &["merge", "kiln"]);
+    assert_ok(&again);
+    let again = String::from_utf8(again.stdout).unwrap();
+    assert!(again.contains("already up to date"), "{again}");
+}
+
+#[test]
+fn diverged_merge_shows_both_sides() {
+    let dir = tempdir().unwrap();
+    assert_ok(&mori(dir.path(), &["init"]));
+    fs::write(
+        dir.path().join("orchard.md"),
+        "the orchard plan waits on the north fence\n",
+    )
+    .unwrap();
+    assert_ok(&mori(dir.path(), &["add", "orchard.md"]));
+    assert_ok(&mori(dir.path(), &["commit", "-m", "remember the orchard"]));
+
+    assert_ok(&mori(dir.path(), &["checkout", "-b", "kiln"]));
+    fs::write(dir.path().join("kiln.md"), "the kiln runs hot at dusk\n").unwrap();
+    assert_ok(&mori(dir.path(), &["add", "kiln.md"]));
+    assert_ok(&mori(dir.path(), &["commit", "-m", "note the kiln"]));
+
+    assert_ok(&mori(dir.path(), &["checkout", "main"]));
+    fs::write(
+        dir.path().join("shed.md"),
+        "the shed door sticks after rain\n",
+    )
+    .unwrap();
+    assert_ok(&mori(dir.path(), &["add", "shed.md"]));
+    assert_ok(&mori(dir.path(), &["commit", "-m", "note the shed"]));
+
+    let merged = mori(dir.path(), &["merge", "kiln", "-m", "bring the kiln back"]);
+    assert_ok(&merged);
+    let merged = String::from_utf8(merged.stdout).unwrap();
+    assert!(merged.contains("bring the kiln back"), "{merged}");
+
+    let log = mori(dir.path(), &["log", "-n", "20"]);
+    assert_ok(&log);
+    let log = String::from_utf8(log.stdout).unwrap();
+    assert!(log.contains("bring the kiln back"), "{log}");
+    assert!(log.contains("note the shed"), "{log}");
+    assert!(log.contains("note the kiln"), "{log}");
+    assert!(log.contains("remember the orchard"), "{log}");
+    assert!(log.contains("Merge:"), "{log}");
+
+    let kiln = mori(dir.path(), &["recall", "kiln dusk"]);
+    assert_ok(&kiln);
+    let kiln = String::from_utf8(kiln.stdout).unwrap();
+    assert!(kiln.contains("kiln"), "{kiln}");
+
+    let shed = mori(dir.path(), &["recall", "shed door"]);
+    assert_ok(&shed);
+    let shed = String::from_utf8(shed.stdout).unwrap();
+    assert!(shed.contains("shed"), "{shed}");
+
+    let refused = mori(dir.path(), &["rebase", "kiln"]);
+    assert!(!refused.status.success());
+    let refused = String::from_utf8(refused.stderr).unwrap();
+    assert!(refused.contains("merge commits"), "{refused}");
+}
+
+#[test]
+fn rebase_replays_onto_main_without_moving_main() {
+    let dir = tempdir().unwrap();
+    assert_ok(&mori(dir.path(), &["init"]));
+    fs::write(
+        dir.path().join("orchard.md"),
+        "the orchard plan waits on the north fence\n",
+    )
+    .unwrap();
+    assert_ok(&mori(dir.path(), &["add", "orchard.md"]));
+    assert_ok(&mori(dir.path(), &["commit", "-m", "remember the orchard"]));
+
+    assert_ok(&mori(dir.path(), &["checkout", "-b", "kiln"]));
+    fs::write(dir.path().join("kiln.md"), "the kiln runs hot at dusk\n").unwrap();
+    assert_ok(&mori(dir.path(), &["add", "kiln.md"]));
+    assert_ok(&mori(dir.path(), &["commit", "-m", "note the kiln"]));
+
+    assert_ok(&mori(dir.path(), &["checkout", "main"]));
+    fs::write(
+        dir.path().join("shed.md"),
+        "the shed door sticks after rain\n",
+    )
+    .unwrap();
+    assert_ok(&mori(dir.path(), &["add", "shed.md"]));
+    assert_ok(&mori(dir.path(), &["commit", "-m", "note the shed"]));
+
+    assert_ok(&mori(dir.path(), &["checkout", "kiln"]));
+    fs::write(dir.path().join("roof.md"), "the unfinished copper roof\n").unwrap();
+    assert_ok(&mori(dir.path(), &["add", "roof.md"]));
+    let dirty = mori(dir.path(), &["rebase", "main"]);
+    assert!(!dirty.status.success());
+    let dirty = String::from_utf8(dirty.stderr).unwrap();
+    assert!(dirty.contains("staged"), "{dirty}");
+    assert_ok(&mori(dir.path(), &["reset"]));
+
+    let onto_itself = mori(dir.path(), &["rebase", "kiln"]);
+    assert!(!onto_itself.status.success());
+    let onto_itself = String::from_utf8(onto_itself.stderr).unwrap();
+    assert!(onto_itself.contains("itself"), "{onto_itself}");
+
+    let rebased = mori(dir.path(), &["rebase", "main"]);
+    assert_ok(&rebased);
+    let rebased = String::from_utf8(rebased.stdout).unwrap();
+    assert!(rebased.contains("rebased 1 onto main"), "{rebased}");
+    assert!(rebased.contains("note the kiln"), "{rebased}");
+
+    assert_ok(&mori(dir.path(), &["checkout", "-b", "side"]));
+    assert_ok(&mori(dir.path(), &["checkout", "kiln"]));
+
+    let kiln = mori(dir.path(), &["recall", "kiln dusk"]);
+    assert_ok(&kiln);
+    let kiln = String::from_utf8(kiln.stdout).unwrap();
+    assert!(kiln.contains("kiln"), "{kiln}");
+
+    let shed = mori(dir.path(), &["recall", "shed door"]);
+    assert_ok(&shed);
+    let shed = String::from_utf8(shed.stdout).unwrap();
+    assert!(shed.contains("shed"), "{shed}");
+
+    assert_ok(&mori(dir.path(), &["checkout", "main"]));
+    let hidden = mori(dir.path(), &["recall", "kiln dusk"]);
+    assert_ok(&hidden);
+    let hidden = String::from_utf8(hidden.stdout).unwrap();
+    assert!(hidden.contains("nothing recalled"), "{hidden}");
+
+    let still = mori(dir.path(), &["recall", "shed door"]);
+    assert_ok(&still);
+    let still = String::from_utf8(still.stdout).unwrap();
+    assert!(still.contains("shed"), "{still}");
+
+    assert_ok(&mori(dir.path(), &["checkout", "kiln"]));
+    let same = mori(dir.path(), &["rebase", "side"]);
+    assert_ok(&same);
+    let same = String::from_utf8(same.stdout).unwrap();
+    assert!(same.contains("already up to date"), "{same}");
+}

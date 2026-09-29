@@ -5,8 +5,8 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use mori::{
-    compile_context, detect_kind, find_repo, init_repo, read_source, ContextKind, Memory, Repo,
-    StageIndex, StagedContext, Stash,
+    compile_context, detect_kind, find_repo, init_repo, read_source, ContextKind, Memory,
+    MergeOutcome, RebaseOutcome, Repo, StageIndex, StagedContext, Stash,
 };
 use uuid::Uuid;
 
@@ -77,6 +77,18 @@ enum Command {
         /// Create the branch at the current tip, then check it out.
         #[arg(short = 'b')]
         branch: bool,
+    },
+    /// Bring another branch into the current one.
+    Merge {
+        branch: String,
+        /// Message for a merge commit. Fast-forwards do not use it.
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+    /// Replay the current branch's commits onto another branch.
+    Rebase {
+        /// Branch to replay onto. That branch is left where it is.
+        onto: String,
     },
     /// Park staged context so you can check out another branch.
     Stash {
@@ -167,6 +179,8 @@ async fn run() -> Result<()> {
         Command::Status => cmd_status().await,
         Command::Branch { name } => cmd_branch(name).await,
         Command::Checkout { name, branch } => cmd_checkout(&name, branch).await,
+        Command::Merge { branch, message } => cmd_merge(&branch, message.as_deref()).await,
+        Command::Rebase { onto } => cmd_rebase(&onto).await,
         Command::Stash { message, action } => cmd_stash(message, action).await,
         Command::Compile {
             sources,
@@ -371,6 +385,16 @@ async fn cmd_log(limit: usize) -> Result<()> {
     }
     for record in records {
         println!("commit {}", record.id);
+        if !record.merge_parents.is_empty() {
+            let mut parents = Vec::new();
+            if let Some(parent) = &record.parent {
+                parents.push(short(parent).to_string());
+            }
+            for parent in &record.merge_parents {
+                parents.push(short(parent).to_string());
+            }
+            println!("Merge: {}", parents.join(" "));
+        }
         println!("session {}", record.session);
         println!("Date: {}", record.created_at.to_rfc3339());
         println!();
@@ -495,6 +519,58 @@ async fn cmd_checkout(name: &str, create: bool) -> Result<()> {
         println!("checked out branch {name}");
     }
     Ok(())
+}
+
+async fn cmd_merge(branch: &str, message: Option<&str>) -> Result<()> {
+    let repo = repo_from_cwd()?;
+    refuse_dirty(&repo, "merging")?;
+    let config = repo.load_config()?;
+    let memory = Memory::connect(&repo).await?;
+    let current = memory.current_branch().await?;
+    let outcome = memory
+        .merge(branch, message, &config.default_session)
+        .await?;
+    memory.disconnect();
+    match outcome {
+        MergeOutcome::UpToDate => println!("already up to date"),
+        MergeOutcome::FastForward { commit_id } => {
+            println!("fast-forward to {}", short(&commit_id));
+        }
+        MergeOutcome::Merged { commit } => {
+            println!("[{current} {}] {}", short(&commit.id), commit.message);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_rebase(onto: &str) -> Result<()> {
+    let repo = repo_from_cwd()?;
+    refuse_dirty(&repo, "rebasing")?;
+    let memory = Memory::connect(&repo).await?;
+    let outcome = memory.rebase(onto).await?;
+    memory.disconnect();
+    match outcome {
+        RebaseOutcome::UpToDate => println!("already up to date"),
+        RebaseOutcome::FastForward { commit_id } => {
+            println!("fast-forward to {}", short(&commit_id));
+        }
+        RebaseOutcome::Rebased { commits, tip } => {
+            println!("rebased {} onto {onto}", commits.len());
+            for commit in &commits {
+                println!("  {} {}", short(&commit.id), commit.message);
+            }
+            println!("HEAD {}", short(&tip));
+        }
+    }
+    Ok(())
+}
+
+fn refuse_dirty(repo: &Repo, action: &str) -> Result<()> {
+    if StageIndex::load(repo)?.is_empty() {
+        Ok(())
+    } else {
+        bail!("staged context is in the way; stash or commit it before {action}")
+    }
 }
 
 async fn cmd_stash(message: Option<String>, action: Option<StashCommand>) -> Result<()> {

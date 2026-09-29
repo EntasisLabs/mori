@@ -31,7 +31,7 @@ mori recall "orchard plan"
 mori show <commit> --raw           # raw STTP is opt-in
 ```
 
-A branch is a name pointing at a commit. `log`, `recall`, and `find` follow that chain, so context committed on another branch stays out of view. Shared history stays visible on both. Nodes are not copied.
+A branch is a name pointing at a commit. `log`, `recall`, and `find` follow every parent from that commit, so a merge makes both sides visible and context committed only on another branch stays out of view. Shared history stays visible on both. Nodes are not copied.
 
 ```bash
 mori branch                        # list, current branch marked *
@@ -46,6 +46,18 @@ mori stash -m "hold the kiln notes"
 mori stash list
 mori stash pop
 ```
+
+`merge` brings another branch into the current one. When one tip already contains the other, mori moves the branch pointer. Otherwise it writes a merge commit with both parents and no new context. Stored context is additive, so both sides stay visible and there is no content-conflict step.
+
+`rebase` replays the commits that belong only to the current branch onto another tip. The branch you rebase onto stays where it is. A merge commit is refused rather than replayed with a parent dropped.
+
+```bash
+mori merge kiln
+mori merge kiln -m "bring the kiln notes back"
+mori rebase main
+```
+
+Both refuse when context is staged. This history is local to the repo.
 
 `--session` is a label Locus stores on the context. It is not a branch. The default session is `main`.
 

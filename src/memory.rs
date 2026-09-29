@@ -140,39 +140,116 @@ impl Memory {
         let record = CommitRecord {
             id: Uuid::new_v4().simple().to_string(),
             parent,
+            merge_parents: Vec::new(),
             message: message.to_string(),
             session: session.to_string(),
             created_at: Utc::now(),
             entries,
         };
-
-        let mut params = QueryParams::new();
-        params.insert("mori_commit_id".to_string(), json!(record.id));
-        params.insert("mori_parent".to_string(), json!(record.parent));
-        params.insert("mori_message".to_string(), json!(record.message));
-        params.insert("mori_scope".to_string(), json!(record.session));
-        params.insert(
-            "mori_created_at".to_string(),
-            json!(record.created_at.to_rfc3339()),
-        );
-        params.insert(
-            "mori_entries".to_string(),
-            serde_json::to_value(&record.entries)?,
-        );
-
-        self.client
-            .raw_query(
-                &format!(
-                    "CREATE mori_commit:`{}` SET commit_id = $mori_commit_id, parent = $mori_parent, message = $mori_message, session = $mori_scope, created_at = $mori_created_at, entries = $mori_entries;",
-                    record.id
-                ),
-                params,
-            )
-            .await
-            .context("writing commit")?;
-
+        self.store_commit(&record).await?;
         self.write_branch(&branch, Some(&record.id)).await?;
         Ok(record)
+    }
+
+    /// Bring `branch` into the current branch.
+    ///
+    /// A fast-forward moves the current pointer. A real merge writes one commit
+    /// with both parents and no new context. Stored nodes stay where they are.
+    pub async fn merge(
+        &self,
+        branch: &str,
+        message: Option<&str>,
+        session: &str,
+    ) -> Result<MergeOutcome> {
+        let branch = validate_branch_name(branch)?;
+        let current = self.current_branch().await?;
+        if branch == current {
+            bail!("cannot merge a branch into itself");
+        }
+        let ours = self.branch_tip(&current).await?;
+        let theirs = self.branch_tip(branch).await?;
+        if self.is_ancestor(theirs.as_deref(), ours.as_deref()).await? {
+            return Ok(MergeOutcome::UpToDate);
+        }
+        if self.is_ancestor(ours.as_deref(), theirs.as_deref()).await? {
+            let commit_id = theirs
+                .clone()
+                .ok_or_else(|| anyhow!("branch '{branch}' has no commits"))?;
+            self.write_branch(&current, Some(&commit_id)).await?;
+            return Ok(MergeOutcome::FastForward { commit_id });
+        }
+
+        let message = message
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("merge {branch} into {current}"));
+        let record = CommitRecord {
+            id: Uuid::new_v4().simple().to_string(),
+            parent: ours,
+            merge_parents: vec![theirs.ok_or_else(|| anyhow!("branch '{branch}' has no commits"))?],
+            message,
+            session: session.to_string(),
+            created_at: Utc::now(),
+            entries: Vec::new(),
+        };
+        self.store_commit(&record).await?;
+        self.write_branch(&current, Some(&record.id)).await?;
+        Ok(MergeOutcome::Merged { commit: record })
+    }
+
+    /// Replay this branch's own commits onto `onto`.
+    ///
+    /// The target branch stays where it is. Merge commits are refused before
+    /// anything is written, because replaying them would drop a parent.
+    pub async fn rebase(&self, onto: &str) -> Result<RebaseOutcome> {
+        let onto = validate_branch_name(onto)?;
+        let current = self.current_branch().await?;
+        if onto == current {
+            bail!("cannot rebase a branch onto itself");
+        }
+        let onto_tip = self.branch_tip(onto).await?;
+        let current_tip = self.branch_tip(&current).await?;
+        let onto_history = self.reachable(onto_tip.as_deref()).await?;
+        let pending = self
+            .first_parent_commits(current_tip.as_deref(), &onto_history)
+            .await?;
+        if pending
+            .iter()
+            .any(|record| !record.merge_parents.is_empty())
+        {
+            bail!("rebase does not replay merge commits");
+        }
+        if pending.is_empty() {
+            if current_tip == onto_tip {
+                return Ok(RebaseOutcome::UpToDate);
+            }
+            let commit_id = onto_tip
+                .clone()
+                .ok_or_else(|| anyhow!("branch '{onto}' has no commits"))?;
+            self.write_branch(&current, Some(&commit_id)).await?;
+            return Ok(RebaseOutcome::FastForward { commit_id });
+        }
+
+        let mut parent = onto_tip;
+        let mut commits = Vec::with_capacity(pending.len());
+        for record in pending.into_iter().rev() {
+            let replay = CommitRecord {
+                id: Uuid::new_v4().simple().to_string(),
+                parent: parent.clone(),
+                merge_parents: Vec::new(),
+                message: record.message,
+                session: record.session,
+                created_at: record.created_at,
+                entries: record.entries,
+            };
+            self.store_commit(&replay).await?;
+            parent = Some(replay.id.clone());
+            commits.push(replay);
+        }
+        let tip = parent.ok_or_else(|| anyhow!("rebase produced no commits"))?;
+        self.write_branch(&current, Some(&tip)).await?;
+        Ok(RebaseOutcome::Rebased { commits, tip })
     }
 
     pub async fn current_branch(&self) -> Result<String> {
@@ -243,24 +320,8 @@ impl Memory {
     }
 
     pub async fn log(&self, limit: usize) -> Result<Vec<CommitRecord>> {
-        let Some(head) = self.branch_tip(&self.current_branch().await?).await? else {
-            return Ok(Vec::new());
-        };
-        let mut records = Vec::new();
-        let mut seen = HashSet::new();
-        let mut cursor = Some(head);
-        let limit = limit.max(1);
-        while let Some(id) = cursor {
-            if records.len() >= limit || !seen.insert(id.clone()) {
-                break;
-            }
-            let Some(record) = self.commit_by_id(&id).await? else {
-                break;
-            };
-            cursor = record.parent.clone();
-            records.push(record);
-        }
-        Ok(records)
+        let head = self.branch_tip(&self.current_branch().await?).await?;
+        self.walk_history(head.as_deref(), Some(limit.max(1))).await
     }
 
     pub async fn find_commit(&self, prefix: &str) -> Result<CommitRecord> {
@@ -471,15 +532,8 @@ impl Memory {
 
     async fn visible_nodes(&self) -> Result<VisibleNodes> {
         let mut visible = VisibleNodes::default();
-        let mut seen = HashSet::new();
-        let mut cursor = self.branch_tip(&self.current_branch().await?).await?;
-        while let Some(id) = cursor {
-            if !seen.insert(id.clone()) {
-                break;
-            }
-            let Some(record) = self.commit_by_id(&id).await? else {
-                break;
-            };
+        let head = self.branch_tip(&self.current_branch().await?).await?;
+        for record in self.walk_history(head.as_deref(), None).await? {
             for entry in &record.entries {
                 if let Some(identity) = self.node_identity(&entry.node_id).await? {
                     if !identity.sync_key.is_empty() {
@@ -490,9 +544,115 @@ impl Memory {
                     }
                 }
             }
-            cursor = record.parent;
         }
         Ok(visible)
+    }
+
+    async fn store_commit(&self, record: &CommitRecord) -> Result<()> {
+        let mut params = QueryParams::new();
+        params.insert("mori_commit_id".to_string(), json!(record.id));
+        params.insert("mori_parent".to_string(), json!(record.parent));
+        params.insert(
+            "mori_merge_parents".to_string(),
+            json!(record.merge_parents),
+        );
+        params.insert("mori_message".to_string(), json!(record.message));
+        params.insert("mori_scope".to_string(), json!(record.session));
+        params.insert(
+            "mori_created_at".to_string(),
+            json!(record.created_at.to_rfc3339()),
+        );
+        params.insert(
+            "mori_entries".to_string(),
+            serde_json::to_value(&record.entries)?,
+        );
+
+        self.client
+            .raw_query(
+                &format!(
+                    "CREATE mori_commit:`{}` SET commit_id = $mori_commit_id, parent = $mori_parent, merge_parents = $mori_merge_parents, message = $mori_message, session = $mori_scope, created_at = $mori_created_at, entries = $mori_entries;",
+                    record.id
+                ),
+                params,
+            )
+            .await
+            .context("writing commit")?;
+        Ok(())
+    }
+
+    /// `ancestor` is an ancestor of `descendant` when walking every parent of
+    /// `descendant` reaches it. A missing commit is an ancestor of every history.
+    async fn is_ancestor(&self, ancestor: Option<&str>, descendant: Option<&str>) -> Result<bool> {
+        let Some(ancestor) = ancestor else {
+            return Ok(true);
+        };
+        Ok(self.reachable(descendant).await?.contains(ancestor))
+    }
+
+    async fn reachable(&self, start: Option<&str>) -> Result<HashSet<String>> {
+        Ok(self
+            .walk_history(start, None)
+            .await?
+            .into_iter()
+            .map(|record| record.id)
+            .collect())
+    }
+
+    /// Newest first. Stops when a commit is already in `stop`, which is the
+    /// history being replayed onto.
+    async fn first_parent_commits(
+        &self,
+        start: Option<&str>,
+        stop: &HashSet<String>,
+    ) -> Result<Vec<CommitRecord>> {
+        let mut records = Vec::new();
+        let mut seen = HashSet::new();
+        let mut cursor = start.map(str::to_string);
+        while let Some(id) = cursor {
+            if stop.contains(&id) || !seen.insert(id.clone()) {
+                break;
+            }
+            let Some(record) = self.commit_by_id(&id).await? else {
+                break;
+            };
+            cursor = record.parent.clone();
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    /// Newest first. Merge parents are pushed before the first parent so the
+    /// first parent is visited next, then the merged-in history.
+    async fn walk_history(
+        &self,
+        start: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<CommitRecord>> {
+        let Some(start) = start else {
+            return Ok(Vec::new());
+        };
+        let mut records = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![start.to_string()];
+        while let Some(id) = stack.pop() {
+            if limit.is_some_and(|limit| records.len() >= limit) {
+                break;
+            }
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some(record) = self.commit_by_id(&id).await? else {
+                continue;
+            };
+            for parent in record.merge_parents.iter().rev() {
+                stack.push(parent.clone());
+            }
+            if let Some(parent) = &record.parent {
+                stack.push(parent.clone());
+            }
+            records.push(record);
+        }
+        Ok(records)
     }
 
     async fn node_identity(&self, node_id: &str) -> Result<Option<NodeIdentity>> {
@@ -642,11 +802,34 @@ pub struct CommitEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitRecord {
     pub id: String,
+    /// First parent. Ordinary commits have only this one.
     pub parent: Option<String>,
+    /// Extra parents written by merge. Empty on commits that are not merges.
+    #[serde(default)]
+    pub merge_parents: Vec<String>,
     pub message: String,
     pub session: String,
     pub created_at: DateTime<Utc>,
     pub entries: Vec<CommitEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MergeOutcome {
+    UpToDate,
+    FastForward { commit_id: String },
+    Merged { commit: CommitRecord },
+}
+
+#[derive(Debug, Clone)]
+pub enum RebaseOutcome {
+    UpToDate,
+    FastForward {
+        commit_id: String,
+    },
+    Rebased {
+        commits: Vec<CommitRecord>,
+        tip: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -677,9 +860,23 @@ fn commit_from_row(row: &Value) -> Result<CommitRecord> {
         Value::String(text) if !text.is_empty() && text != "null" => Some(text.clone()),
         _ => None,
     });
+    let merge_parents = row
+        .get("merge_parents")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|value| match value {
+                    Value::String(text) if !text.is_empty() && text != "null" => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(CommitRecord {
         id,
         parent,
+        merge_parents,
         message: row
             .get("message")
             .and_then(Value::as_str)
