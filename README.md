@@ -35,11 +35,11 @@ A branch is a name pointing at a commit. `log`, `recall`, and `find` follow that
 
 ```bash
 mori branch                        # list, current branch marked *
-mori switch -c kiln                # new branch at the current tip
-mori switch main                   # refuses if context is staged
+mori checkout -b kiln              # new branch at the current tip
+mori checkout main                 # refuses if context is staged
 ```
 
-`stash` parks the index so you can switch. `stash pop` puts it back onto an empty index.
+`stash` parks the index so you can check out another branch. `stash pop` puts it back onto an empty index.
 
 ```bash
 mori stash -m "hold the kiln notes"

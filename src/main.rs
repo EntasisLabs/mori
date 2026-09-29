@@ -72,13 +72,13 @@ enum Command {
         name: Option<String>,
     },
     /// Check out a branch. Refuses when context is staged.
-    Switch {
+    Checkout {
         name: String,
         /// Create the branch at the current tip, then check it out.
-        #[arg(short = 'c', long)]
-        create: bool,
+        #[arg(short = 'b')]
+        branch: bool,
     },
-    /// Park staged context so you can switch branches.
+    /// Park staged context so you can check out another branch.
     Stash {
         /// Message recorded on the stash. Used when parking context.
         #[arg(short, long)]
@@ -166,7 +166,7 @@ async fn run() -> Result<()> {
         } => cmd_add(sources, kind.into(), session),
         Command::Status => cmd_status().await,
         Command::Branch { name } => cmd_branch(name).await,
-        Command::Switch { name, create } => cmd_switch(&name, create).await,
+        Command::Checkout { name, branch } => cmd_checkout(&name, branch).await,
         Command::Stash { message, action } => cmd_stash(message, action).await,
         Command::Compile {
             sources,
@@ -474,23 +474,25 @@ async fn cmd_branch(name: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_switch(name: &str, create: bool) -> Result<()> {
+async fn cmd_checkout(name: &str, create: bool) -> Result<()> {
     let repo = repo_from_cwd()?;
     let index = StageIndex::load(&repo)?;
     let memory = Memory::connect(&repo).await?;
     let current = memory.current_branch().await?;
     if current != name && !index.is_empty() {
-        bail!("staged context is in the way; stash or commit it before switching branches");
+        bail!(
+            "staged context is in the way; stash or commit it before checking out another branch"
+        );
     }
     if create {
         memory.create_branch(name).await?;
     }
-    memory.switch_branch(name).await?;
+    memory.checkout_branch(name).await?;
     memory.disconnect();
     if create {
-        println!("switched to new branch {name}");
+        println!("checked out new branch {name}");
     } else {
-        println!("switched to branch {name}");
+        println!("checked out branch {name}");
     }
     Ok(())
 }

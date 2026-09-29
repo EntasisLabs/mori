@@ -218,7 +218,7 @@ impl Memory {
         Ok(name.to_string())
     }
 
-    pub async fn switch_branch(&self, name: &str) -> Result<String> {
+    pub async fn checkout_branch(&self, name: &str) -> Result<String> {
         let name = validate_branch_name(name)?;
         if self.read_branch(name).await?.is_none() {
             bail!("branch '{name}' does not exist");

@@ -134,7 +134,7 @@ fn branches_keep_recall_on_their_own_history() {
     assert_ok(&mori(dir.path(), &["add", "orchard.md"]));
     assert_ok(&mori(dir.path(), &["commit", "-m", "remember the orchard"]));
 
-    assert_ok(&mori(dir.path(), &["switch", "-c", "kiln"]));
+    assert_ok(&mori(dir.path(), &["checkout", "-b", "kiln"]));
     fs::write(dir.path().join("kiln.md"), "the kiln runs hot at dusk\n").unwrap();
     assert_ok(&mori(dir.path(), &["add", "kiln.md"]));
     assert_ok(&mori(dir.path(), &["commit", "-m", "note the kiln"]));
@@ -149,7 +149,7 @@ fn branches_keep_recall_on_their_own_history() {
     let shared = String::from_utf8(shared.stdout).unwrap();
     assert!(shared.contains("orchard"), "{shared}");
 
-    assert_ok(&mori(dir.path(), &["switch", "main"]));
+    assert_ok(&mori(dir.path(), &["checkout", "main"]));
     let hidden = mori(dir.path(), &["recall", "kiln dusk"]);
     assert_ok(&hidden);
     let hidden = String::from_utf8(hidden.stdout).unwrap();
@@ -173,7 +173,7 @@ fn branches_keep_recall_on_their_own_history() {
 }
 
 #[test]
-fn stash_lets_you_switch_and_come_back() {
+fn stash_lets_you_checkout_and_come_back() {
     let dir = tempdir().unwrap();
     assert_ok(&mori(dir.path(), &["init"]));
     fs::write(
@@ -183,7 +183,7 @@ fn stash_lets_you_switch_and_come_back() {
     .unwrap();
     assert_ok(&mori(dir.path(), &["add", "roof.md"]));
 
-    let blocked = mori(dir.path(), &["switch", "-c", "other"]);
+    let blocked = mori(dir.path(), &["checkout", "-b", "other"]);
     assert!(!blocked.status.success());
     let blocked = String::from_utf8(blocked.stderr).unwrap();
     assert!(blocked.contains("stash"), "{blocked}");
@@ -201,7 +201,7 @@ fn stash_lets_you_switch_and_come_back() {
     assert!(listed.contains("hold the roof"), "{listed}");
     assert!(listed.contains("branch main"), "{listed}");
 
-    assert_ok(&mori(dir.path(), &["switch", "-c", "other"]));
+    assert_ok(&mori(dir.path(), &["checkout", "-b", "other"]));
     assert_ok(&mori(dir.path(), &["stash", "pop"]));
     let restored = mori(dir.path(), &["status"]);
     assert_ok(&restored);
