@@ -49,11 +49,11 @@ impl From<KindArg> for ContextKind {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a cognition repo in this directory.
+    /// Start a mori folder in this directory.
     Init {
         /// Directory to initialize. Defaults to the current directory.
         path: Option<PathBuf>,
-        /// Default Locus session label stored on new context.
+        /// Label stored on new context. This is not a branch.
         #[arg(long, default_value = "main")]
         session: String,
     },
@@ -97,17 +97,17 @@ enum Command {
         #[command(subcommand)]
         action: Option<RemoteCommand>,
     },
-    /// Copy another SurrealDB's context into remote-tracking branches.
+    /// Download another copy's history. Your current branch stays put.
     Fetch {
         /// Remote name. Defaults to `origin`.
         remote: Option<String>,
     },
-    /// Send the current branch to a remote SurrealDB.
+    /// Send the current branch to another copy.
     Push {
         /// Remote name. Defaults to `origin`.
         remote: Option<String>,
     },
-    /// Fetch, fast-forward when the remote is ahead, then push.
+    /// Download, move forward when you are simply behind, then send your branch.
     Sync {
         /// Remote name. Defaults to `origin`.
         remote: Option<String>,
@@ -120,7 +120,7 @@ enum Command {
         #[command(subcommand)]
         action: Option<StashCommand>,
     },
-    /// Compile context into STTP and print it. Does not open the database.
+    /// Show how mori would store this, without saving it.
     Compile {
         /// Files to compile. With no paths, compile whatever is staged.
         sources: Vec<String>,
@@ -129,7 +129,7 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
-    /// Compile staged context and store it in this repo's SurrealKV file.
+    /// Save staged context into this folder's memory.
     Commit {
         #[arg(short, long)]
         message: String,
@@ -145,7 +145,7 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
-    /// Rank stored context against a question.
+    /// Ask what this branch remembers.
     Recall {
         query: String,
         #[arg(long)]
@@ -170,7 +170,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum RemoteCommand {
-    /// Remember a SurrealDB endpoint. `ws://`, `wss://`, `http://`, and `https://`.
+    /// Remember another copy. Use ws://, wss://, http://, or https://.
     Add {
         name: String,
         endpoint: String,

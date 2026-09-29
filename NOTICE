@@ -1,0 +1,17 @@
+mori
+Copyright 2026 Entasis Labs
+
+This product is licensed under the MIT License or the Apache License, Version 2.0.
+See LICENSE-MIT and LICENSE-APACHE.
+
+This product includes Locus (https://github.com/EntasisLabs/locus),
+licensed under the Apache License, Version 2.0.
+
+Prebuilt mori binaries also include SurrealDB (https://github.com/surrealdb/surrealdb).
+SurrealDB 3 is licensed under the Business Source License 1.1, not under MIT or
+Apache-2.0. The change date in that license is 2030-01-01, after which the
+change license is Apache-2.0. The additional use grant forbids offering
+SurrealDB as a database service to third parties. Read the SurrealDB license
+before you redistribute a mori binary:
+
+https://github.com/surrealdb/surrealdb/blob/main/LICENSE

@@ -2,9 +2,16 @@
 name = "mori"
 version = "0.1.0"
 edition = "2021"
-description = "mori — the git for cognition. Compile context with the Locus SDK and keep it in a per-repo SurrealKV file."
-license = "Apache-2.0"
+description = "mori — the git for cognition. Remember documents, chats, and notes in a folder."
+authors = ["Entasis Labs"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/EntasisLabs/mori"
+homepage = "https://github.com/EntasisLabs/mori"
 readme = "README.md"
+keywords = ["cli", "memory", "locus", "notes"]
+categories = ["command-line-utilities"]
+# Source is dual-licensed. Binary releases are built by the release workflow.
+# crates.io publishing stays off until a maintainer turns it on. See RELEASING.md.
 publish = false
 
 [[bin]]
