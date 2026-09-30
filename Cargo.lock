@@ -2460,7 +2460,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mori"
+name = "mori-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
