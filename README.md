@@ -8,23 +8,39 @@ mori is the cognition VCS. [Locus](https://github.com/EntasisLabs/locus) is the 
 
 ## Status
 
-0.1.0 is a local CLI. This version has no remote and no forge. The license is Apache-2.0. The crate is not on crates.io (`publish = false`).
+Apache-2.0. 0.1.0 is a local CLI for now: no remote and no forge. Install from crates.io or GitHub Releases.
 
 ## Install
 
-You need a recent stable Rust toolchain. `rust-toolchain.toml` sets the channel to `stable`.
+`cargo install mori` is the usual path. You need a recent stable Rust toolchain.
 
 ```bash
+cargo install mori
+```
+
+The install script downloads the matching GitHub Release archive and puts `mori` in `~/.local/bin`.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/EntasisLabs/mori/main/scripts/install.sh | bash
+```
+
+`~/.local/bin` needs to be on `PATH`. Set `MORI_INSTALL_DIR` to choose another directory. `/usr/local/bin` is the other common choice:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/EntasisLabs/mori/main/scripts/install.sh | sudo env MORI_INSTALL_DIR=/usr/local/bin bash
+```
+
+`MORI_VERSION=v0.1.0` installs that tag instead of the latest release. The script supports Linux x86_64, macOS (Apple Silicon and Intel), and Windows x86_64 from Git Bash. The Linux archive is built on Ubuntu 24.04; on an older glibc, use `cargo install mori`.
+
+To build from a clone:
+
+```bash
+git clone https://github.com/EntasisLabs/mori
+cd mori
 cargo install --path .
 ```
 
-That installs the `mori` binary. To build it in the repo instead:
-
-```bash
-cargo build --release
-```
-
-The binary is `target/release/mori`.
+`cargo build --release` writes `target/release/mori` and does not install it. `rust-toolchain.toml` selects the stable channel.
 
 There is no daemon. Each command opens the store, does one thing, and disconnects.
 

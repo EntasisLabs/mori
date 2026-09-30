@@ -5,7 +5,7 @@ edition = "2021"
 description = "mori — the git for cognition. Compile context with the Locus SDK and keep it in a per-repo SurrealKV file."
 license = "Apache-2.0"
 readme = "README.md"
-publish = false
+publish = true
 
 [[bin]]
 name = "mori"
