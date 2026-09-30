@@ -1,0 +1,144 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, such as v0.1.0. Leave empty to build this ref without publishing."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-24.04 is pinned so the glibc baseline stays 2.39 while ubuntu-latest moves.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          # macos-15-intel is the hosted x86_64 image. GitHub retires Intel macOS runners in fall 2027.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' && inputs.tag || github.sha }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${TAG_INPUT}" ]]; then
+            tag="${TAG_INPUT}"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag=""
+          fi
+
+          if [[ -n "${tag}" ]]; then
+            if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$ ]]; then
+              echo "mori: tag '${tag}' is not a vX.Y.Z release tag" >&2
+              exit 1
+            fi
+            version="${tag#v}"
+            cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+            if [[ "${version}" != "${cargo_version}" ]]; then
+              echo "mori: tag ${tag} does not match Cargo.toml version ${cargo_version}" >&2
+              exit 1
+            fi
+          else
+            version="dev-${GITHUB_SHA:0:7}"
+          fi
+
+          bin_name="mori"
+          ext="tar.gz"
+          if [[ "${TARGET}" == *windows* ]]; then
+            bin_name="mori.exe"
+            ext="zip"
+          fi
+
+          src="target/${TARGET}/release/${bin_name}"
+          if [[ ! -f "${src}" ]]; then
+            echo "mori: missing binary ${src}" >&2
+            exit 1
+          fi
+
+          name="mori-${version}-${TARGET}"
+          stage="dist/stage/${name}"
+          mkdir -p "${stage}" dist/out
+          cp "${src}" "${stage}/${bin_name}"
+          cp LICENSE README.md "${stage}/"
+
+          if [[ "${ext}" == "zip" ]]; then
+            py=python3
+            command -v python3 >/dev/null 2>&1 || py=python
+            "${py}" -c 'import os, sys, zipfile; stage, dest, names = sys.argv[1:]; zf = zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED); [zf.write(os.path.join(stage, name), arcname=name) for name in names.split(",")]; zf.close()' "${stage}" "dist/out/${name}.zip" "${bin_name},LICENSE,README.md"
+          else
+            tar -C "${stage}" -czf "dist/out/${name}.tar.gz" "${bin_name}" LICENSE README.md
+          fi
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum mori-* | tee sha256sums.txt
+
+      - name: Publish
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          files: |
+            dist/mori-*
+            dist/sha256sums.txt
+          fail_on_unmatched_files: true
+          generate_release_notes: true
