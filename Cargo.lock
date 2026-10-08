@@ -2469,6 +2469,7 @@ dependencies = [
  "locus-core-rs",
  "locus-sdk",
  "locus-surreal-adapter",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

@@ -128,10 +128,7 @@ fn render_with_sdk(staged: &StagedContext, kind: ContextKind, summary: &str) -> 
         .with_timestamp(staged.added_at)
         .with_context_summary(summary)
         .with_avec(avec, avec)
-        .with_semantic_tags(vec![
-            kind.as_str().to_string(),
-            format!("source:{}", source_tag(&staged.source)),
-        ]);
+        .with_semantic_tags(semantic_tags(kind, &staged.source, &staged.tags));
 
     let document = SttpDocumentBuilder::new(metadata)
         .merge(SttpContentSlice::from_confidence_map(content)?)?
@@ -338,6 +335,24 @@ fn summary_line(source: &str, text: &str) -> String {
     }
 }
 
+/// Kind and source tags Mori already writes, plus the facets from `mori add --tag`.
+fn semantic_tags(kind: ContextKind, source: &str, user_tags: &[String]) -> Vec<String> {
+    let mut tags = vec![
+        kind.as_str().to_string(),
+        format!("source:{}", source_tag(source)),
+    ];
+    for tag in user_tags {
+        if tags
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(tag))
+        {
+            continue;
+        }
+        tags.push(tag.clone());
+    }
+    tags
+}
+
 fn source_tag(source: &str) -> String {
     if source == "-" {
         return "-".to_string();
@@ -366,6 +381,7 @@ mod tests {
             source: source.to_string(),
             text: text.to_string(),
             added_at: Utc::now(),
+            tags: Vec::new(),
         }
     }
 
@@ -407,6 +423,29 @@ mod tests {
         assert!(compiled.raw_sttp.contains("⊕⟨"));
         assert!(compiled.raw_sttp.contains("orchard"));
         assert!(compiled.summary.contains("orchard"));
+        assert!(compiled.raw_sttp.contains("source:notes.md"));
+    }
+
+    #[test]
+    fn user_tags_merge_with_the_document_tags() {
+        let mut entry = staged(
+            ContextKind::Document,
+            "notes.md",
+            "the orchard plan waits on the north fence",
+        );
+        entry.tags = vec!["homelab".to_string(), "pxe".to_string()];
+        let compiled = compile_context(&entry).unwrap();
+        assert!(
+            compiled.raw_sttp.contains("homelab"),
+            "{}",
+            compiled.raw_sttp
+        );
+        assert!(compiled.raw_sttp.contains("pxe"), "{}", compiled.raw_sttp);
+        assert!(
+            compiled.raw_sttp.contains("source:notes.md"),
+            "{}",
+            compiled.raw_sttp
+        );
     }
 
     #[test]

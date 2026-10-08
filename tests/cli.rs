@@ -397,3 +397,161 @@ fn rebase_replays_onto_main_without_moving_main() {
     let same = String::from_utf8(same.stdout).unwrap();
     assert!(same.contains("already up to date"), "{same}");
 }
+
+#[test]
+fn tags_excerpts_and_one_word_recall_filter() {
+    let dir = tempdir().unwrap();
+    assert_ok(&mori(dir.path(), &["init"]));
+
+    let runbook = "\
+# API runbook
+
+The service overview stays quiet.
+
+## Escalation
+
+Primary on-call has 15 minutes to ack. After that PagerDuty escalates to the secondary.
+
+## Rollback
+
+Use deployctl to roll back the last release.
+";
+    let handoff = "\
+# Handoff
+
+Search escalation still points at the old team.
+
+## Pager
+
+The rotation calendar is stale.
+Fix the xylophone entry in pagerduty before the next rotation.
+";
+    fs::write(dir.path().join("runbook.md"), runbook).unwrap();
+    fs::write(dir.path().join("handoff.md"), handoff).unwrap();
+
+    assert_ok(&mori(
+        dir.path(),
+        &["add", "runbook.md", "--tag", "homelab,pxe"],
+    ));
+    assert_ok(&mori(
+        dir.path(),
+        &["add", "handoff.md", "--tag", "Jellyfin"],
+    ));
+
+    let status = mori(dir.path(), &["status"]);
+    assert_ok(&status);
+    let status = String::from_utf8(status.stdout).unwrap();
+    assert!(status.contains("[homelab, pxe]"), "{status}");
+    assert!(status.contains("[jellyfin]"), "{status}");
+
+    assert_ok(&mori(dir.path(), &["commit", "-m", "on-call notes"]));
+
+    let log = mori(dir.path(), &["log"]);
+    assert_ok(&log);
+    let log = String::from_utf8(log.stdout).unwrap();
+    assert!(log.contains("tags: homelab, pxe"), "{log}");
+    assert!(log.contains("tags: jellyfin"), "{log}");
+    assert!(!log.contains('⊕'), "{log}");
+
+    let by_tag = mori(dir.path(), &["recall", "escalation", "--tag", "pxe"]);
+    assert_ok(&by_tag);
+    let by_tag = String::from_utf8(by_tag.stdout).unwrap();
+    assert!(by_tag.contains("runbook"), "{by_tag}");
+    assert!(!by_tag.contains("Handoff"), "{by_tag}");
+    assert!(!by_tag.contains('§'), "{by_tag}");
+
+    let other = mori(dir.path(), &["find", "--tag", "jellyfin"]);
+    assert_ok(&other);
+    let other = String::from_utf8(other.stdout).unwrap();
+    assert!(other.contains("Handoff"), "{other}");
+    assert!(!other.contains("runbook"), "{other}");
+
+    let both = mori(dir.path(), &["find", "--tag", "homelab", "--tag", "pxe"]);
+    assert_ok(&both);
+    let both = String::from_utf8(both.stdout).unwrap();
+    assert!(both.contains("runbook"), "{both}");
+    assert!(!both.contains("Handoff"), "{both}");
+
+    let none = mori(
+        dir.path(),
+        &[
+            "recall",
+            "escalation",
+            "--tag",
+            "homelab",
+            "--tag",
+            "jellyfin",
+        ],
+    );
+    assert_ok(&none);
+    let none = String::from_utf8(none.stdout).unwrap();
+    assert!(none.contains("nothing recalled"), "{none}");
+
+    let one_word = mori(dir.path(), &["recall", "xylophone"]);
+    assert_ok(&one_word);
+    let one_word = String::from_utf8(one_word.stdout).unwrap();
+    assert!(one_word.contains("Handoff"), "{one_word}");
+    assert!(!one_word.contains("runbook"), "{one_word}");
+    assert!(!one_word.contains("xylophone"), "{one_word}");
+    assert!(!one_word.contains('§'), "{one_word}");
+    assert!(
+        one_word.lines().any(|line| line.starts_with("retrieved ")),
+        "{one_word}"
+    );
+
+    let summary = mori(dir.path(), &["recall", "service overview"]);
+    assert_ok(&summary);
+    let summary = String::from_utf8(summary.stdout).unwrap();
+    assert!(summary.contains("runbook"), "{summary}");
+    assert!(!summary.contains('§'), "{summary}");
+    assert!(!summary.contains("15 minutes"), "{summary}");
+    assert!(!summary.contains("deployctl"), "{summary}");
+
+    let excerpt = mori(dir.path(), &["recall", "pagerduty escalation", "--excerpt"]);
+    assert_ok(&excerpt);
+    let excerpt = String::from_utf8(excerpt.stdout).unwrap();
+    assert!(excerpt.contains("§"), "{excerpt}");
+    assert!(
+        excerpt.contains("Escalation") || excerpt.contains("Pager"),
+        "{excerpt}"
+    );
+    assert!(
+        excerpt.contains("PagerDuty") || excerpt.contains("pagerduty"),
+        "{excerpt}"
+    );
+    assert!(!excerpt.contains("deployctl"), "{excerpt}");
+
+    let matched = mori(
+        dir.path(),
+        &["recall", "api runbook", "--excerpt", "--match", "deployctl"],
+    );
+    assert_ok(&matched);
+    let matched = String::from_utf8(matched.stdout).unwrap();
+    assert!(matched.contains("deployctl"), "{matched}");
+    assert!(matched.contains("Rollback"), "{matched}");
+    assert!(!matched.contains("15 minutes"), "{matched}");
+
+    let found = mori(dir.path(), &["find", "--match", "xylophone"]);
+    assert_ok(&found);
+    let found = String::from_utf8(found.stdout).unwrap();
+    assert!(found.contains("Handoff"), "{found}");
+    assert!(!found.contains("runbook"), "{found}");
+    assert!(!found.contains('§'), "{found}");
+    assert!(!found.contains("xylophone"), "{found}");
+
+    let tagged_match = mori(
+        dir.path(),
+        &["find", "--tag", "homelab", "--match", "deployctl"],
+    );
+    assert_ok(&tagged_match);
+    let tagged_match = String::from_utf8(tagged_match.stdout).unwrap();
+    assert!(tagged_match.contains("runbook"), "{tagged_match}");
+    assert!(!tagged_match.contains("Handoff"), "{tagged_match}");
+
+    let narrow = mori(dir.path(), &["recall", "xylophone", "--excerpt", "-C", "0"]);
+    assert_ok(&narrow);
+    let narrow = String::from_utf8(narrow.stdout).unwrap();
+    assert!(narrow.contains("xylophone"), "{narrow}");
+    assert!(narrow.contains("§"), "{narrow}");
+    assert!(!narrow.contains("rotation calendar"), "{narrow}");
+}

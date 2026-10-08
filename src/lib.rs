@@ -5,13 +5,15 @@
 //! opened for one command and dropped when that command finishes.
 
 mod compile;
+mod excerpt;
 mod memory;
 mod repo;
 mod stage;
 mod stash;
 
 pub use compile::{compile_context, detect_kind, CompiledContext};
+pub use excerpt::{view_hits, MatchPattern, ViewOptions, ViewedHit};
 pub use memory::{BranchInfo, Memory, MergeOutcome, RebaseOutcome, Recalled};
 pub use repo::{find_repo, init_repo, Repo};
-pub use stage::{read_source, ContextKind, StageIndex, StagedContext};
+pub use stage::{normalize_tags, read_source, ContextKind, StageIndex, StagedContext};
 pub use stash::{Stash, StashEntry};

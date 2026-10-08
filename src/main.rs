@@ -3,10 +3,11 @@ use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use mori::{
-    compile_context, detect_kind, find_repo, init_repo, read_source, ContextKind, Memory,
-    MergeOutcome, RebaseOutcome, Repo, StageIndex, StagedContext, Stash,
+    compile_context, detect_kind, find_repo, init_repo, normalize_tags, read_source, view_hits,
+    ContextKind, MatchPattern, Memory, MergeOutcome, RebaseOutcome, Recalled, Repo, StageIndex,
+    StagedContext, Stash, ViewOptions, ViewedHit,
 };
 use uuid::Uuid;
 
@@ -45,6 +46,36 @@ impl From<KindArg> for ContextKind {
     }
 }
 
+#[derive(Args, Clone)]
+struct TagArgs {
+    /// Facet. Repeat for several, or pass a comma-separated list.
+    #[arg(long = "tag", value_name = "TAG")]
+    tag: Vec<String>,
+}
+
+#[derive(Args, Clone)]
+struct CutArgs {
+    /// Print matching sections (path and heading) instead of the summary line.
+    #[arg(long)]
+    excerpt: bool,
+    /// Print the stored text of each hit instead of the summary line.
+    #[arg(long)]
+    full: bool,
+    /// Keep hits whose text matches this regular expression, and use it to choose sections.
+    #[arg(long = "match", value_name = "PATTERN")]
+    pattern: Option<String>,
+    /// With --excerpt, lines of context around each match instead of the whole section.
+    #[arg(short = 'C', long = "context", value_name = "N")]
+    context_lines: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum DisplayMode {
+    Summary,
+    Excerpt,
+    Full,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Create a cognition repo in this directory.
@@ -63,6 +94,8 @@ enum Command {
         kind: KindArg,
         #[arg(long)]
         session: Option<String>,
+        #[command(flatten)]
+        tags: TagArgs,
     },
     /// Show the branch, HEAD, staged context, and stash.
     Status,
@@ -106,6 +139,8 @@ enum Command {
         kind: KindArg,
         #[arg(long)]
         session: Option<String>,
+        #[command(flatten)]
+        tags: TagArgs,
     },
     /// Compile staged context and store it in this repo's SurrealKV file.
     Commit {
@@ -124,12 +159,19 @@ enum Command {
         raw: bool,
     },
     /// Rank stored context against a question.
+    ///
+    /// Prints one summary line per hit. `--excerpt` prints matching sections,
+    /// `--full` prints stored text, and `--raw` prints STTP.
     Recall {
         query: String,
         #[arg(long)]
         session: Option<String>,
+        #[command(flatten)]
+        tags: TagArgs,
         #[arg(long, default_value_t = 8)]
         limit: usize,
+        #[command(flatten)]
+        cut: CutArgs,
         #[arg(long)]
         raw: bool,
     },
@@ -137,10 +179,14 @@ enum Command {
     Find {
         #[arg(long)]
         session: Option<String>,
+        #[command(flatten)]
+        tags: TagArgs,
         #[arg(long)]
         contains: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        #[command(flatten)]
+        cut: CutArgs,
     },
     /// Unstage context. With no paths, unstage everything.
     Reset { sources: Vec<String> },
@@ -175,7 +221,8 @@ async fn run() -> Result<()> {
             sources,
             kind,
             session,
-        } => cmd_add(sources, kind.into(), session),
+            tags,
+        } => cmd_add(sources, kind.into(), session, &tags.tag),
         Command::Status => cmd_status().await,
         Command::Branch { name } => cmd_branch(name).await,
         Command::Checkout { name, branch } => cmd_checkout(&name, branch).await,
@@ -186,21 +233,35 @@ async fn run() -> Result<()> {
             sources,
             kind,
             session,
-        } => cmd_compile(sources, kind.into(), session),
+            tags,
+        } => cmd_compile(sources, kind.into(), session, &tags.tag),
         Command::Commit { message } => cmd_commit(&message).await,
         Command::Log { limit } => cmd_log(limit).await,
         Command::Show { rev, raw } => cmd_show(&rev, raw).await,
         Command::Recall {
             query,
             session,
+            tags,
             limit,
+            cut,
             raw,
-        } => cmd_recall(&query, session.as_deref(), limit, raw).await,
+        } => cmd_recall(&query, session.as_deref(), &tags.tag, limit, &cut, raw).await,
         Command::Find {
             session,
+            tags,
             contains,
             limit,
-        } => cmd_find(session.as_deref(), contains.as_deref(), limit).await,
+            cut,
+        } => {
+            cmd_find(
+                session.as_deref(),
+                &tags.tag,
+                contains.as_deref(),
+                limit,
+                &cut,
+            )
+            .await
+        }
         Command::Reset { sources } => cmd_reset(sources),
     }
 }
@@ -221,10 +282,16 @@ async fn cmd_init(path: Option<PathBuf>, session: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_add(sources: Vec<String>, kind: ContextKind, session: Option<String>) -> Result<()> {
+fn cmd_add(
+    sources: Vec<String>,
+    kind: ContextKind,
+    session: Option<String>,
+    tags: &[String],
+) -> Result<()> {
     if sources.is_empty() {
         bail!("nothing specified, nothing added");
     }
+    let tags = normalize_tags(tags)?;
     let repo = repo_from_cwd()?;
     let config = repo.load_config()?;
     let session = session.unwrap_or(config.default_session);
@@ -242,12 +309,18 @@ fn cmd_add(sources: Vec<String>, kind: ContextKind, session: Option<String>) -> 
             source,
             text,
             added_at: Utc::now(),
+            tags: tags.clone(),
         });
     }
     let staged = index.entries().to_vec();
     index.save(&repo)?;
     for entry in staged {
-        println!("staged {} {}", entry.kind.as_str(), entry.source);
+        println!(
+            "staged {} {}{}",
+            entry.kind.as_str(),
+            entry.source,
+            tags_suffix(&entry.tags)
+        );
     }
     Ok(())
 }
@@ -291,18 +364,25 @@ async fn cmd_status() -> Result<()> {
         println!("staged context:");
         for entry in index.entries() {
             println!(
-                "  {:<10} {}  ({})",
+                "  {:<10} {}  ({}){}",
                 entry.kind.as_str(),
                 entry.source,
-                entry.session
+                entry.session,
+                tags_suffix(&entry.tags)
             );
         }
     }
     Ok(())
 }
 
-fn cmd_compile(sources: Vec<String>, kind: ContextKind, session: Option<String>) -> Result<()> {
-    let staged = if sources.is_empty() {
+fn cmd_compile(
+    sources: Vec<String>,
+    kind: ContextKind,
+    session: Option<String>,
+    tags: &[String],
+) -> Result<()> {
+    let tags = normalize_tags(tags)?;
+    let mut staged = if sources.is_empty() {
         let repo = repo_from_cwd()?;
         StageIndex::load(&repo)?.entries().to_vec()
     } else {
@@ -324,10 +404,20 @@ fn cmd_compile(sources: Vec<String>, kind: ContextKind, session: Option<String>)
                     source,
                     text,
                     added_at: Utc::now(),
+                    tags: tags.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?
     };
+    if !tags.is_empty() {
+        for entry in &mut staged {
+            for tag in &tags {
+                if !entry.tags.iter().any(|existing| existing == tag) {
+                    entry.tags.push(tag.clone());
+                }
+            }
+        }
+    }
 
     if staged.is_empty() {
         bail!("nothing to compile");
@@ -367,7 +457,12 @@ async fn cmd_commit(message: &str) -> Result<()> {
     println!("[{} {}] {}", branch, short(&record.id), record.message);
     println!(" {} context stored", record.entries.len());
     for entry in &record.entries {
-        println!("  {} {}", entry.kind.as_str(), entry.source);
+        println!(
+            "  {} {}{}",
+            entry.kind.as_str(),
+            entry.source,
+            tags_suffix(&entry.tags)
+        );
     }
     Ok(())
 }
@@ -403,6 +498,7 @@ async fn cmd_log(limit: usize) -> Result<()> {
         for entry in &record.entries {
             println!("    {} {}", entry.kind.as_str(), entry.source);
             println!("    {}", entry.summary);
+            print_entry_tags(&entry.tags);
         }
         println!();
     }
@@ -422,6 +518,7 @@ async fn cmd_show(rev: &str, raw: bool) -> Result<()> {
     for entry in &record.entries {
         println!("    {} {}", entry.kind.as_str(), entry.source);
         println!("    {}", entry.summary);
+        print_entry_tags(&entry.tags);
         if raw {
             let text = memory.node_raw(&entry.node_id).await?;
             println!();
@@ -433,14 +530,108 @@ async fn cmd_show(rev: &str, raw: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_recall(query: &str, session: Option<&str>, limit: usize, raw: bool) -> Result<()> {
+async fn cmd_recall(
+    query: &str,
+    session: Option<&str>,
+    tags: &[String],
+    limit: usize,
+    cut: &CutArgs,
+    raw: bool,
+) -> Result<()> {
+    let tags = normalize_tags(tags)?;
+    let pattern = MatchPattern::compile(cut.pattern.as_deref())?;
+    let mode = display_mode(cut, raw)?;
+    if matches!(mode, DisplayMode::Excerpt) && query.trim().is_empty() && pattern.is_none() {
+        bail!("--excerpt needs a query or --match to choose sections");
+    }
     let repo = repo_from_cwd()?;
     let memory = Memory::connect(&repo).await?;
-    let hits = memory.recall(query, session, limit).await?;
+    let widen = !matches!(mode, DisplayMode::Summary) || pattern.is_some();
+    let hits = memory.recall(query, session, &tags, limit, widen).await?;
     memory.disconnect();
+    if matches!(mode, DisplayMode::Summary) && pattern.is_none() {
+        print_recall_summaries(&hits, raw);
+        return Ok(());
+    }
+    let viewed = view_hits(
+        &hits,
+        &ViewOptions {
+            query: Some(query),
+            pattern: pattern.as_ref(),
+            literal: None,
+            excerpt: matches!(mode, DisplayMode::Excerpt),
+            full: matches!(mode, DisplayMode::Full),
+            context_lines: cut.context_lines,
+            limit,
+        },
+    )?;
+    print_recall(&viewed, mode, raw);
+    Ok(())
+}
+
+async fn cmd_find(
+    session: Option<&str>,
+    tags: &[String],
+    contains: Option<&str>,
+    limit: usize,
+    cut: &CutArgs,
+) -> Result<()> {
+    let tags = normalize_tags(tags)?;
+    let pattern = MatchPattern::compile(cut.pattern.as_deref())?;
+    let mode = display_mode(cut, false)?;
+    if matches!(mode, DisplayMode::Excerpt) && pattern.is_none() && contains.is_none() {
+        bail!("--excerpt needs --match or --contains to choose sections");
+    }
+    let repo = repo_from_cwd()?;
+    let memory = Memory::connect(&repo).await?;
+    let widen = !matches!(mode, DisplayMode::Summary) || pattern.is_some();
+    let hits = memory.find(session, contains, &tags, limit, widen).await?;
+    memory.disconnect();
+    if matches!(mode, DisplayMode::Summary) && pattern.is_none() {
+        print_find_summaries(&hits);
+        return Ok(());
+    }
+    let viewed = view_hits(
+        &hits,
+        &ViewOptions {
+            query: None,
+            pattern: pattern.as_ref(),
+            literal: contains,
+            excerpt: matches!(mode, DisplayMode::Excerpt),
+            full: matches!(mode, DisplayMode::Full),
+            context_lines: cut.context_lines,
+            limit,
+        },
+    )?;
+    print_find(&viewed, mode);
+    Ok(())
+}
+
+fn display_mode(cut: &CutArgs, raw: bool) -> Result<DisplayMode> {
+    if cut.excerpt && cut.full {
+        bail!(
+            "--excerpt prints matching sections and --full prints the stored text; choose one view"
+        );
+    }
+    if raw && (cut.excerpt || cut.full) {
+        bail!("--raw prints the stored STTP; --excerpt and --full print the document text");
+    }
+    if cut.context_lines.is_some() && !cut.excerpt {
+        bail!("-C sets context lines for --excerpt");
+    }
+    Ok(if cut.full {
+        DisplayMode::Full
+    } else if cut.excerpt {
+        DisplayMode::Excerpt
+    } else {
+        DisplayMode::Summary
+    })
+}
+
+fn print_recall_summaries(hits: &[Recalled], raw: bool) {
     if hits.is_empty() {
         println!("nothing recalled");
-        return Ok(());
+        return;
     }
     let path = hits
         .first()
@@ -453,23 +644,82 @@ async fn cmd_recall(query: &str, session: Option<&str>, limit: usize, raw: bool)
             println!("{}", hit.raw_sttp);
         }
     }
-    Ok(())
 }
 
-async fn cmd_find(session: Option<&str>, contains: Option<&str>, limit: usize) -> Result<()> {
-    let repo = repo_from_cwd()?;
-    let memory = Memory::connect(&repo).await?;
-    let hits = memory.find(session, contains, limit).await?;
-    memory.disconnect();
+fn print_recall(hits: &[ViewedHit], mode: DisplayMode, raw: bool) {
+    if hits.is_empty() {
+        println!("nothing recalled");
+        return;
+    }
+    let path = hits
+        .first()
+        .map(|hit| hit.path.as_str())
+        .unwrap_or("recall");
+    println!("retrieved {} via {path}", hits.len());
+    for (index, hit) in hits.iter().enumerate() {
+        match mode {
+            DisplayMode::Summary => {
+                println!("{}", hit.summary);
+                if raw {
+                    println!("{}", hit.raw_sttp);
+                }
+            }
+            DisplayMode::Excerpt | DisplayMode::Full => {
+                if index > 0 {
+                    println!();
+                }
+                for line in &hit.lines {
+                    println!("{line}");
+                }
+            }
+        }
+    }
+}
+
+fn print_find_summaries(hits: &[Recalled]) {
     if hits.is_empty() {
         println!("nothing found");
-        return Ok(());
+        return;
     }
     println!("found {}", hits.len());
     for hit in hits {
         println!("{}", hit.summary);
     }
-    Ok(())
+}
+
+fn print_find(hits: &[ViewedHit], mode: DisplayMode) {
+    if hits.is_empty() {
+        println!("nothing found");
+        return;
+    }
+    println!("found {}", hits.len());
+    for (index, hit) in hits.iter().enumerate() {
+        match mode {
+            DisplayMode::Summary => println!("{}", hit.summary),
+            DisplayMode::Excerpt | DisplayMode::Full => {
+                if index > 0 {
+                    println!();
+                }
+                for line in &hit.lines {
+                    println!("{line}");
+                }
+            }
+        }
+    }
+}
+
+fn tags_suffix(tags: &[String]) -> String {
+    if tags.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", tags.join(", "))
+    }
+}
+
+fn print_entry_tags(tags: &[String]) {
+    if !tags.is_empty() {
+        println!("    tags: {}", tags.join(", "));
+    }
 }
 
 async fn cmd_branch(name: Option<String>) -> Result<()> {

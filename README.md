@@ -67,6 +67,33 @@ mori show <commit> --raw
 
 `recall` ranks stored context against the query (8 hits by default). `find` filters without ranking. `log`, `status`, `recall`, and `find` print the summary. The STTP text stays in the store until you ask for it with `compile`, `show --raw`, or `recall --raw`.
 
+## Tags
+
+`--tag` is a facet on the context, separate from `--session`. Repeat it, or pass a comma-separated list. Tags are stored with the `document` and `source:` tags mori already writes. `recall` and `find` require every tag you pass.
+
+```bash
+mori add notes.md --tag homelab --tag pxe --tag jellyfin
+mori add notes.md --tag homelab,pxe,jellyfin
+mori commit -m "homelab notes"
+mori recall --tag jellyfin
+mori recall "boot" --tag pxe --tag homelab
+mori find --tag homelab
+```
+
+`status`, `log`, and `show` list the tags you added. A one-word `recall` query filters on that word. A query with two or more content words is ranked as before.
+
+## Excerpts
+
+Summary lines stay the default. `--excerpt` prints the matching section of each hit, with the file path and heading. Plain text is cut on blank lines. `--match` is a case-insensitive regular expression: it filters hits, and with `--excerpt` it chooses the sections. `-C` keeps that many lines around each match. `--full` prints the stored text of each hit. `--raw` still prints STTP.
+
+```bash
+mori recall "pagerduty escalation" --excerpt
+mori recall "api outage" --match "rollback|deployctl"
+mori find --tag oncall --match pagerduty
+mori recall "pagerduty" --excerpt -C 2
+mori recall "pagerduty escalation" --full
+```
+
 ## Branches
 
 A branch is a name pointing at a commit. `log`, `recall`, and `find` follow every parent from that commit. A merge makes both sides visible. Context committed only on another branch stays out of view. Shared history stays visible on both. Nodes are not copied.

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -12,9 +12,10 @@ use locus_core_rs::{
     StoreContextService, SttpNodeParser, SurrealDbClient, SurrealDbNodeStore,
     SurrealDbRuntimeOptions, SurrealDbSemanticIndexStore, TreeSitterValidator,
 };
+use locus_sdk::application::memory_lexical::parse_lexical_query;
 use locus_sdk::prelude::{
-    FallbackPolicy, MemoryFindRequest, MemoryFindService, MemoryPage, MemoryRecallRequest,
-    MemoryRecallService, MemoryScope, MemoryScoring, StrictnessMode,
+    FallbackPolicy, MemoryFilter, MemoryFindRequest, MemoryFindService, MemoryPage,
+    MemoryRecallRequest, MemoryRecallService, MemoryScope, MemoryScoring, StrictnessMode,
 };
 use locus_surreal_adapter::RuntimeSurrealDbClient;
 use serde::{Deserialize, Serialize};
@@ -132,6 +133,7 @@ impl Memory {
                 session: compiled.session,
                 source: compiled.source,
                 summary: compiled.summary,
+                tags: item.tags.clone(),
             });
         }
 
@@ -367,7 +369,9 @@ impl Memory {
         &self,
         query: &str,
         session: Option<&str>,
+        tags: &[String],
         limit: usize,
+        widen: bool,
     ) -> Result<Vec<Recalled>> {
         let visible = self.visible_nodes().await?;
         if visible.is_empty() {
@@ -383,6 +387,7 @@ impl Memory {
                     limit: scan_limit(limit),
                     cursor: None,
                 },
+                filter: memory_filter(tags, single_content_term(query)),
                 scoring: MemoryScoring {
                     fallback_policy: FallbackPolicy::OnEmpty,
                     strictness: StrictnessMode::Balanced,
@@ -396,28 +401,16 @@ impl Memory {
             .await?;
 
         let path = format!("{:?}", result.retrieval_path).to_ascii_lowercase();
-        Ok(result
-            .nodes
-            .into_iter()
-            .filter(|node| visible.matches(node.sync_key.as_str(), node.raw.as_str()))
-            .take(limit)
-            .map(|node| Recalled {
-                session: node.session_id,
-                summary: node
-                    .context_summary
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "(stored context)".to_string()),
-                raw_sttp: node.raw,
-                path: path.clone(),
-            })
-            .collect())
+        Ok(take_visible(result.nodes, &visible, &path, limit, widen))
     }
 
     pub async fn find(
         &self,
         session: Option<&str>,
         contains: Option<&str>,
+        tags: &[String],
         limit: usize,
+        widen: bool,
     ) -> Result<Vec<Recalled>> {
         let visible = self.visible_nodes().await?;
         if visible.is_empty() {
@@ -426,33 +419,21 @@ impl Memory {
         let limit = limit.max(1);
         let find = MemoryFindService::new(self.store.clone() as Arc<dyn NodeStore>)
             .with_semantic_index(self.index.clone() as Arc<dyn SemanticIndexStore>);
-        let mut request = MemoryFindRequest {
+        let text_contains = contains
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        let request = MemoryFindRequest {
             scope: scope_for(session),
             page: MemoryPage {
                 limit: scan_limit(limit),
                 cursor: None,
             },
+            filter: memory_filter(tags, text_contains),
             ..MemoryFindRequest::default()
         };
-        if let Some(text) = contains.map(str::trim).filter(|text| !text.is_empty()) {
-            request.filter.text_contains = Some(text.to_string());
-        }
         let result = find.execute(&request).await?;
-        Ok(result
-            .nodes
-            .into_iter()
-            .filter(|node| visible.matches(node.sync_key.as_str(), node.raw.as_str()))
-            .take(limit)
-            .map(|node| Recalled {
-                session: node.session_id,
-                summary: node
-                    .context_summary
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "(stored context)".to_string()),
-                raw_sttp: node.raw,
-                path: "find".to_string(),
-            })
-            .collect())
+        Ok(take_visible(result.nodes, &visible, "find", limit, widen))
     }
 
     async fn ensure_branch(&self) -> Result<()> {
@@ -537,10 +518,18 @@ impl Memory {
             for entry in &record.entries {
                 if let Some(identity) = self.node_identity(&entry.node_id).await? {
                     if !identity.sync_key.is_empty() {
-                        visible.sync_keys.insert(identity.sync_key);
+                        visible.sync_keys.insert(identity.sync_key.clone());
+                        visible
+                            .source_by_sync
+                            .entry(identity.sync_key)
+                            .or_insert_with(|| entry.source.clone());
                     }
                     if !identity.raw.is_empty() {
-                        visible.raws.insert(identity.raw);
+                        visible.raws.insert(identity.raw.clone());
+                        visible
+                            .source_by_raw
+                            .entry(identity.raw)
+                            .or_insert_with(|| entry.source.clone());
                     }
                 }
             }
@@ -706,6 +695,8 @@ struct BranchRow {
 struct VisibleNodes {
     sync_keys: HashSet<String>,
     raws: HashSet<String>,
+    source_by_sync: HashMap<String, String>,
+    source_by_raw: HashMap<String, String>,
 }
 
 impl VisibleNodes {
@@ -716,6 +707,20 @@ impl VisibleNodes {
     fn matches(&self, sync_key: &str, raw: &str) -> bool {
         (!sync_key.is_empty() && self.sync_keys.contains(sync_key))
             || (!raw.is_empty() && self.raws.contains(raw))
+    }
+
+    fn source_for(&self, sync_key: &str, raw: &str) -> String {
+        if !sync_key.is_empty() {
+            if let Some(source) = self.source_by_sync.get(sync_key) {
+                return source.clone();
+            }
+        }
+        if !raw.is_empty() {
+            if let Some(source) = self.source_by_raw.get(raw) {
+                return source.clone();
+            }
+        }
+        String::new()
     }
 }
 
@@ -797,6 +802,9 @@ pub struct CommitEntry {
     pub session: String,
     pub source: String,
     pub summary: String,
+    /// Facets from `mori add --tag`. Empty on commits written before tags existed.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -838,6 +846,63 @@ pub struct Recalled {
     pub summary: String,
     pub raw_sttp: String,
     pub path: String,
+    /// Path passed to `mori add`, when this node is on the current branch.
+    pub source: String,
+}
+
+fn take_visible(
+    nodes: Vec<locus_core_rs::domain::models::SttpNode>,
+    visible: &VisibleNodes,
+    path: &str,
+    limit: usize,
+    widen: bool,
+) -> Vec<Recalled> {
+    let cap = if widen { scan_limit(limit) } else { limit };
+    nodes
+        .into_iter()
+        .filter(|node| visible.matches(node.sync_key.as_str(), node.raw.as_str()))
+        .take(cap)
+        .map(|node| Recalled {
+            source: visible.source_for(node.sync_key.as_str(), node.raw.as_str()),
+            session: node.session_id,
+            summary: node
+                .context_summary
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "(stored context)".to_string()),
+            raw_sttp: node.raw,
+            path: path.to_string(),
+        })
+        .collect()
+}
+
+/// A one-content-term query never reaches Locus lexical fallback, because the
+/// resonance set is not empty. Constrain that query with `text_contains` so
+/// `mori recall zebra` does not return every note on the branch.
+fn single_content_term(query: &str) -> Option<String> {
+    let parsed = parse_lexical_query(query);
+    if parsed.term_count() != 1 {
+        return None;
+    }
+    parsed
+        .coverage
+        .first()
+        .and_then(|variants| variants.first().cloned())
+}
+
+fn memory_filter(tags: &[String], text_contains: Option<String>) -> MemoryFilter {
+    // `indexed_tags` is the index-backed AND, but the pinned SurrealKV build
+    // rejects that query (`HAVING` is a parse error). `tags_contains` ANDs the
+    // same semantic tags on the nodes recall and find already load.
+    let tags_contains = if tags.is_empty() {
+        None
+    } else {
+        Some(tags.to_vec())
+    };
+    MemoryFilter {
+        text_contains,
+        tags_contains,
+        ..MemoryFilter::default()
+    }
 }
 
 fn commit_from_row(row: &Value) -> Result<CommitRecord> {
@@ -890,4 +955,21 @@ fn commit_from_row(row: &Value) -> Result<CommitRecord> {
         created_at,
         entries,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::single_content_term;
+
+    #[test]
+    fn one_content_term_queries_are_marked_for_filtering() {
+        assert_eq!(single_content_term("zebra").as_deref(), Some("zebra"));
+        assert_eq!(single_content_term("  Zebra ").as_deref(), Some("zebra"));
+        assert_eq!(
+            single_content_term("the orchard").as_deref(),
+            Some("orchard")
+        );
+        assert_eq!(single_content_term("orchard plan"), None);
+        assert_eq!(single_content_term("the"), None);
+    }
 }
