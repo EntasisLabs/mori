@@ -8,7 +8,7 @@ mori is the cognition VCS. [Locus](https://github.com/EntasisLabs/locus) is the 
 
 ## Status
 
-Apache-2.0. 0.1.0 is a local CLI for now: no remote and no forge. Install from crates.io or GitHub Releases.
+Apache-2.0. 0.2.0 is a local CLI for now: no remote and no forge. Install from crates.io or GitHub Releases.
 
 ## Install
 
@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/EntasisLabs/mori/main/scripts/insta
 curl -fsSL https://raw.githubusercontent.com/EntasisLabs/mori/main/scripts/install.sh | sudo env MORI_INSTALL_DIR=/usr/local/bin bash
 ```
 
-`MORI_VERSION=v0.1.0` installs that tag instead of the latest release. The script supports Linux x86_64, macOS (Apple Silicon and Intel), and Windows x86_64 from Git Bash. The Linux archive is built on Ubuntu 24.04; on an older glibc, use `cargo install mori-cli`.
+`MORI_VERSION=v0.2.0` installs that tag instead of the latest release. The script supports Linux x86_64, macOS (Apple Silicon and Intel), and Windows x86_64 from Git Bash. The Linux archive is built on Ubuntu 24.04; on an older glibc, use `cargo install mori-cli`.
 
 To build from a clone:
 

@@ -1,6 +1,6 @@
 [package]
 name = "mori-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "mori — the git for cognition. Compile context with the Locus SDK and keep it in a per-repo SurrealKV file."
 license = "Apache-2.0"
