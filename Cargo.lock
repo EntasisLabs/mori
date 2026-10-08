@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "mori-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2469,6 +2469,7 @@ dependencies = [
  "locus-core-rs",
  "locus-sdk",
  "locus-surreal-adapter",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

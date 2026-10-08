@@ -56,6 +56,9 @@ pub struct StagedContext {
     pub source: String,
     pub text: String,
     pub added_at: DateTime<Utc>,
+    /// User facets. Stored alongside the automatic `document` and `source:` tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -132,6 +135,39 @@ impl StageIndex {
     }
 }
 
+/// Normalize `--tag` values.
+///
+/// Repeating `--tag` and a comma list (`--tag homelab,pxe`) both work. Tags are
+/// trimmed, lowercased, and de-duplicated so they match Locus semantic tags.
+pub fn normalize_tags(values: &[String]) -> Result<Vec<String>> {
+    let mut tags = Vec::new();
+    for value in values {
+        for part in value.split(',') {
+            let tag = part.trim().to_lowercase();
+            if tag.is_empty() {
+                continue;
+            }
+            if !valid_tag(&tag) {
+                bail!(
+                    "tag '{tag}' is invalid; use at most 64 characters and no quotes, backslashes, or structural markers"
+                );
+            }
+            if !tags.iter().any(|existing| existing == &tag) {
+                tags.push(tag);
+            }
+        }
+    }
+    Ok(tags)
+}
+
+fn valid_tag(tag: &str) -> bool {
+    tag.len() <= 64
+        && !tag.contains("ref:")
+        && !tag
+            .chars()
+            .any(|ch| matches!(ch, '"' | '\\' | '\n' | '\r' | '⊕' | '⦿' | '◈' | '⍉'))
+}
+
 pub fn read_source(source: &str) -> Result<String> {
     if source == "-" {
         let mut buffer = String::new();
@@ -144,4 +180,26 @@ pub fn read_source(source: &str) -> Result<String> {
         bail!("{source} is not a file");
     }
     fs::read_to_string(path).with_context(|| format!("reading {source}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_tags;
+
+    #[test]
+    fn tags_split_on_commas_and_ignore_case() {
+        let tags = normalize_tags(&[
+            "HomeLab,pxe".to_string(),
+            "jellyfin".to_string(),
+            "pxe".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(tags, vec!["homelab", "pxe", "jellyfin"]);
+    }
+
+    #[test]
+    fn tags_reject_structural_markers() {
+        let err = normalize_tags(&["bad⊕tag".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("invalid"), "{err}");
+    }
 }

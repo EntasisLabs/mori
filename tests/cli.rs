@@ -1,5 +1,6 @@
 use std::fs;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 use tempfile::tempdir;
 
@@ -9,6 +10,22 @@ fn mori(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("run mori")
+}
+
+fn mori_stdin(dir: &std::path::Path, args: &[&str], stdin: &str) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mori"))
+        .current_dir(dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mori");
+    {
+        let mut input = child.stdin.take().expect("stdin");
+        input.write_all(stdin.as_bytes()).expect("write stdin");
+    }
+    child.wait_with_output().expect("wait mori")
 }
 
 fn assert_ok(output: &std::process::Output) {
@@ -396,4 +413,308 @@ fn rebase_replays_onto_main_without_moving_main() {
     assert_ok(&same);
     let same = String::from_utf8(same.stdout).unwrap();
     assert!(same.contains("already up to date"), "{same}");
+}
+
+#[test]
+fn tags_excerpts_and_one_word_recall_filter() {
+    let dir = tempdir().unwrap();
+    assert_ok(&mori(dir.path(), &["init"]));
+
+    let runbook = "\
+# API runbook
+
+The service overview stays quiet.
+
+## Escalation
+
+Primary on-call has 15 minutes to ack. After that PagerDuty escalates to the secondary.
+
+## Rollback
+
+Use deployctl to roll back the last release.
+";
+    let handoff = "\
+# Handoff
+
+Search escalation still points at the old team.
+
+## Pager
+
+The rotation calendar is stale.
+Fix the xylophone entry in pagerduty before the next rotation.
+";
+    fs::write(dir.path().join("runbook.md"), runbook).unwrap();
+    fs::write(dir.path().join("handoff.md"), handoff).unwrap();
+
+    assert_ok(&mori(
+        dir.path(),
+        &["add", "runbook.md", "--tag", "homelab,pxe"],
+    ));
+    assert_ok(&mori(
+        dir.path(),
+        &["add", "handoff.md", "--tag", "Jellyfin"],
+    ));
+
+    let status = mori(dir.path(), &["status"]);
+    assert_ok(&status);
+    let status = String::from_utf8(status.stdout).unwrap();
+    assert!(status.contains("[homelab, pxe]"), "{status}");
+    assert!(status.contains("[jellyfin]"), "{status}");
+
+    assert_ok(&mori(dir.path(), &["commit", "-m", "on-call notes"]));
+
+    let log = mori(dir.path(), &["log"]);
+    assert_ok(&log);
+    let log = String::from_utf8(log.stdout).unwrap();
+    assert!(log.contains("tags: homelab, pxe"), "{log}");
+    assert!(log.contains("tags: jellyfin"), "{log}");
+    assert!(!log.contains('⊕'), "{log}");
+
+    let by_tag = mori(dir.path(), &["recall", "escalation", "--tag", "pxe"]);
+    assert_ok(&by_tag);
+    let by_tag = String::from_utf8(by_tag.stdout).unwrap();
+    assert!(by_tag.contains("runbook"), "{by_tag}");
+    assert!(!by_tag.contains("Handoff"), "{by_tag}");
+    assert!(!by_tag.contains('§'), "{by_tag}");
+
+    let other = mori(dir.path(), &["find", "--tag", "jellyfin"]);
+    assert_ok(&other);
+    let other = String::from_utf8(other.stdout).unwrap();
+    assert!(other.contains("Handoff"), "{other}");
+    assert!(!other.contains("runbook"), "{other}");
+
+    let both = mori(dir.path(), &["find", "--tag", "homelab", "--tag", "pxe"]);
+    assert_ok(&both);
+    let both = String::from_utf8(both.stdout).unwrap();
+    assert!(both.contains("runbook"), "{both}");
+    assert!(!both.contains("Handoff"), "{both}");
+
+    let none = mori(
+        dir.path(),
+        &[
+            "recall",
+            "escalation",
+            "--tag",
+            "homelab",
+            "--tag",
+            "jellyfin",
+        ],
+    );
+    assert_ok(&none);
+    let none = String::from_utf8(none.stdout).unwrap();
+    assert!(none.contains("nothing recalled"), "{none}");
+
+    let one_word = mori(dir.path(), &["recall", "xylophone"]);
+    assert_ok(&one_word);
+    let one_word = String::from_utf8(one_word.stdout).unwrap();
+    assert!(one_word.contains("Handoff"), "{one_word}");
+    assert!(!one_word.contains("runbook"), "{one_word}");
+    assert!(!one_word.contains("xylophone"), "{one_word}");
+    assert!(!one_word.contains('§'), "{one_word}");
+    assert!(
+        one_word.lines().any(|line| line.starts_with("retrieved ")),
+        "{one_word}"
+    );
+
+    let summary = mori(dir.path(), &["recall", "service overview"]);
+    assert_ok(&summary);
+    let summary = String::from_utf8(summary.stdout).unwrap();
+    assert!(summary.contains("runbook"), "{summary}");
+    assert!(!summary.contains('§'), "{summary}");
+    assert!(!summary.contains("15 minutes"), "{summary}");
+    assert!(!summary.contains("deployctl"), "{summary}");
+
+    let excerpt = mori(dir.path(), &["recall", "pagerduty escalation", "--excerpt"]);
+    assert_ok(&excerpt);
+    let excerpt = String::from_utf8(excerpt.stdout).unwrap();
+    assert!(excerpt.contains("§"), "{excerpt}");
+    assert!(
+        excerpt.contains("Escalation") || excerpt.contains("Pager"),
+        "{excerpt}"
+    );
+    assert!(
+        excerpt.contains("PagerDuty") || excerpt.contains("pagerduty"),
+        "{excerpt}"
+    );
+    assert!(!excerpt.contains("deployctl"), "{excerpt}");
+
+    let matched = mori(
+        dir.path(),
+        &["recall", "api runbook", "--excerpt", "--match", "deployctl"],
+    );
+    assert_ok(&matched);
+    let matched = String::from_utf8(matched.stdout).unwrap();
+    assert!(matched.contains("deployctl"), "{matched}");
+    assert!(matched.contains("Rollback"), "{matched}");
+    assert!(!matched.contains("15 minutes"), "{matched}");
+
+    let found = mori(dir.path(), &["find", "--match", "xylophone"]);
+    assert_ok(&found);
+    let found = String::from_utf8(found.stdout).unwrap();
+    assert!(found.contains("Handoff"), "{found}");
+    assert!(!found.contains("runbook"), "{found}");
+    assert!(!found.contains('§'), "{found}");
+    assert!(!found.contains("xylophone"), "{found}");
+
+    let tagged_match = mori(
+        dir.path(),
+        &["find", "--tag", "homelab", "--match", "deployctl"],
+    );
+    assert_ok(&tagged_match);
+    let tagged_match = String::from_utf8(tagged_match.stdout).unwrap();
+    assert!(tagged_match.contains("runbook"), "{tagged_match}");
+    assert!(!tagged_match.contains("Handoff"), "{tagged_match}");
+
+    let narrow = mori(dir.path(), &["recall", "xylophone", "--excerpt", "-C", "0"]);
+    assert_ok(&narrow);
+    let narrow = String::from_utf8(narrow.stdout).unwrap();
+    assert!(narrow.contains("xylophone"), "{narrow}");
+    assert!(narrow.contains("§"), "{narrow}");
+    assert!(!narrow.contains("rotation calendar"), "{narrow}");
+}
+
+#[test]
+fn notes_chain_until_commit() {
+    let dir = tempdir().unwrap();
+    assert_ok(&mori(dir.path(), &["init"]));
+
+    let empty = mori(dir.path(), &["note", "-m", "   "]);
+    assert!(!empty.status.success());
+    let empty = String::from_utf8(empty.stderr).unwrap();
+    assert!(empty.contains("the note is empty"), "{empty}");
+
+    let path = mori(dir.path(), &["note", "notes.md"]);
+    assert!(!path.status.success());
+    let path = String::from_utf8(path.stderr).unwrap();
+    assert!(path.contains("mori add"), "{path}");
+
+    let both = mori(dir.path(), &["note", "-m", "hi", "-"]);
+    assert!(!both.status.success());
+    let both = String::from_utf8(both.stderr).unwrap();
+    assert!(both.contains("-m sets the note text"), "{both}");
+
+    let untouched = mori(dir.path(), &["status"]);
+    assert_ok(&untouched);
+    let untouched = String::from_utf8(untouched.stdout).unwrap();
+    assert!(untouched.contains("nothing staged"), "{untouched}");
+
+    assert_ok(&mori(
+        dir.path(),
+        &[
+            "note",
+            "-m",
+            "remember to check on-call docs before asking for escalation",
+            "--tag",
+            "oncall",
+        ],
+    ));
+    assert_ok(&mori(
+        dir.path(),
+        &[
+            "note",
+            "-m",
+            "also verify pagerduty routing",
+            "--session",
+            "procedures",
+            "--tag",
+            "oncall",
+        ],
+    ));
+
+    let piped = mori_stdin(
+        dir.path(),
+        &["note", "--tag", "oncall"],
+        "stdin reminder about the xylophone rotation\n\nsecond paragraph stays stored\n",
+    );
+    assert_ok(&piped);
+    let dashed = mori_stdin(
+        dir.path(),
+        &["note", "-", "--session", "procedures", "--tag", "oncall"],
+        "dash note about the rotation calendar\n",
+    );
+    assert_ok(&dashed);
+
+    let status = mori(dir.path(), &["status"]);
+    assert_ok(&status);
+    let status = String::from_utf8(status.stdout).unwrap();
+    assert!(
+        status.contains("remember to check on-call docs"),
+        "{status}"
+    );
+    assert!(status.contains("also verify pagerduty routing"), "{status}");
+    assert!(
+        status.contains("stdin reminder about the xylophone rotation"),
+        "{status}"
+    );
+    assert!(
+        status.contains("dash note about the rotation calendar"),
+        "{status}"
+    );
+    assert!(!status.contains("second paragraph"), "{status}");
+    assert!(status.contains("(main)"), "{status}");
+    assert!(status.contains("(procedures)"), "{status}");
+    assert!(status.contains("[oncall]"), "{status}");
+    assert_eq!(
+        status
+            .lines()
+            .filter(|line| line.contains("note") && line.contains("[oncall]"))
+            .count(),
+        4,
+        "{status}"
+    );
+
+    let commit = mori(dir.path(), &["commit", "-m", "oncall reminders"]);
+    assert_ok(&commit);
+    let commit = String::from_utf8(commit.stdout).unwrap();
+    assert!(commit.contains("note -  [oncall]"), "{commit}");
+    assert_eq!(commit.matches("note -  [oncall]").count(), 4, "{commit}");
+
+    let cleared = mori(dir.path(), &["status"]);
+    assert_ok(&cleared);
+    let cleared = String::from_utf8(cleared.stdout).unwrap();
+    assert!(cleared.contains("nothing staged"), "{cleared}");
+
+    let log = mori(dir.path(), &["log"]);
+    assert_ok(&log);
+    let log = String::from_utf8(log.stdout).unwrap();
+    assert!(log.contains("oncall reminders"), "{log}");
+    assert!(log.contains("remember to check on-call docs"), "{log}");
+    assert!(log.contains("also verify pagerduty routing"), "{log}");
+    assert!(
+        log.contains("stdin reminder about the xylophone rotation"),
+        "{log}"
+    );
+    assert!(
+        log.contains("dash note about the rotation calendar"),
+        "{log}"
+    );
+    assert!(log.contains("note -"), "{log}");
+    assert!(log.contains("tags: oncall"), "{log}");
+    assert!(!log.contains('§'), "{log}");
+    assert!(!log.contains('⊕'), "{log}");
+
+    let session = mori(
+        dir.path(),
+        &["recall", "pagerduty", "--session", "procedures"],
+    );
+    assert_ok(&session);
+    let session = String::from_utf8(session.stdout).unwrap();
+    assert!(session.contains("pagerduty"), "{session}");
+    assert!(!session.contains("on-call docs"), "{session}");
+    assert!(!session.contains('§'), "{session}");
+
+    let summary = mori(dir.path(), &["recall", "xylophone"]);
+    assert_ok(&summary);
+    let summary = String::from_utf8(summary.stdout).unwrap();
+    assert!(
+        summary.contains("stdin reminder about the xylophone rotation"),
+        "{summary}"
+    );
+    assert!(!summary.contains("second paragraph"), "{summary}");
+    assert!(!summary.contains('§'), "{summary}");
+
+    let full = mori(dir.path(), &["recall", "xylophone", "--full"]);
+    assert_ok(&full);
+    let full = String::from_utf8(full.stdout).unwrap();
+    assert!(full.contains("second paragraph stays stored"), "{full}");
 }

@@ -8,7 +8,7 @@ mori is the cognition VCS. [Locus](https://github.com/EntasisLabs/locus) is the 
 
 ## Status
 
-Apache-2.0. 0.1.0 is a local CLI for now: no remote and no forge. Install from crates.io or GitHub Releases.
+Apache-2.0. 0.2.0 is a local CLI for now: no remote and no forge. Install from crates.io or GitHub Releases.
 
 ## Install
 
@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/EntasisLabs/mori/main/scripts/insta
 curl -fsSL https://raw.githubusercontent.com/EntasisLabs/mori/main/scripts/install.sh | sudo env MORI_INSTALL_DIR=/usr/local/bin bash
 ```
 
-`MORI_VERSION=v0.1.0` installs that tag instead of the latest release. The script supports Linux x86_64, macOS (Apple Silicon and Intel), and Windows x86_64 from Git Bash. The Linux archive is built on Ubuntu 24.04; on an older glibc, use `cargo install mori-cli`.
+`MORI_VERSION=v0.2.0` installs that tag instead of the latest release. The script supports Linux x86_64, macOS (Apple Silicon and Intel), and Windows x86_64 from Git Bash. The Linux archive is built on Ubuntu 24.04; on an older glibc, use `cargo install mori-cli`.
 
 To build from a clone:
 
@@ -66,6 +66,51 @@ mori show <commit> --raw
 `commit` requires `-m`. `log` lists commits on the current branch, newest first, 20 by default (`-n` changes the limit). `show` takes a commit id or a unique prefix.
 
 `recall` ranks stored context against the query (8 hits by default). `find` filters without ranking. `log`, `status`, `recall`, and `find` print the summary. The STTP text stays in the store until you ask for it with `compile`, `show --raw`, or `recall --raw`.
+
+## Notes
+
+`note` stages a freeform thought with no file. Each note is one index entry (`kind` `note`) and stays there until `commit`. Later notes append.
+
+```bash
+mori note -m "remember to check on-call docs before asking for escalation" --tag oncall
+mori note -m "also verify pagerduty routing" --session procedures --tag oncall
+mori status
+mori commit -m "oncall reminders"
+```
+
+`--session` and `--tag` work the same way as `add`. Omit `-m` and pipe the text, or pass `-` to read stdin.
+
+```bash
+echo "verify the rotation calendar" | mori note --tag oncall
+mori note - --session procedures
+```
+
+## Tags
+
+`--tag` is a facet on the context, separate from `--session`. Repeat it, or pass a comma-separated list. Tags are stored with the `document` and `source:` tags mori already writes. `recall` and `find` require every tag you pass.
+
+```bash
+mori add notes.md --tag homelab --tag pxe --tag jellyfin
+mori add notes.md --tag homelab,pxe,jellyfin
+mori commit -m "homelab notes"
+mori recall --tag jellyfin
+mori recall "boot" --tag pxe --tag homelab
+mori find --tag homelab
+```
+
+`status`, `log`, and `show` list the tags you added. A one-word `recall` query filters on that word. A query with two or more content words is ranked as before.
+
+## Excerpts
+
+Summary lines stay the default. `--excerpt` prints the matching section of each hit, with the file path and heading. Plain text is cut on blank lines. `--match` is a case-insensitive regular expression: it filters hits, and with `--excerpt` it chooses the sections. `-C` keeps that many lines around each match. `--full` prints the stored text of each hit. `--raw` still prints STTP.
+
+```bash
+mori recall "pagerduty escalation" --excerpt
+mori recall "api outage" --match "rollback|deployctl"
+mori find --tag oncall --match pagerduty
+mori recall "pagerduty" --excerpt -C 2
+mori recall "pagerduty escalation" --full
+```
 
 ## Branches
 
