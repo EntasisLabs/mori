@@ -1,5 +1,6 @@
 use std::fs;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 use tempfile::tempdir;
 
@@ -9,6 +10,22 @@ fn mori(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("run mori")
+}
+
+fn mori_stdin(dir: &std::path::Path, args: &[&str], stdin: &str) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mori"))
+        .current_dir(dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mori");
+    {
+        let mut input = child.stdin.take().expect("stdin");
+        input.write_all(stdin.as_bytes()).expect("write stdin");
+    }
+    child.wait_with_output().expect("wait mori")
 }
 
 fn assert_ok(output: &std::process::Output) {
@@ -554,4 +571,150 @@ Fix the xylophone entry in pagerduty before the next rotation.
     assert!(narrow.contains("xylophone"), "{narrow}");
     assert!(narrow.contains("§"), "{narrow}");
     assert!(!narrow.contains("rotation calendar"), "{narrow}");
+}
+
+#[test]
+fn notes_chain_until_commit() {
+    let dir = tempdir().unwrap();
+    assert_ok(&mori(dir.path(), &["init"]));
+
+    let empty = mori(dir.path(), &["note", "-m", "   "]);
+    assert!(!empty.status.success());
+    let empty = String::from_utf8(empty.stderr).unwrap();
+    assert!(empty.contains("the note is empty"), "{empty}");
+
+    let path = mori(dir.path(), &["note", "notes.md"]);
+    assert!(!path.status.success());
+    let path = String::from_utf8(path.stderr).unwrap();
+    assert!(path.contains("mori add"), "{path}");
+
+    let both = mori(dir.path(), &["note", "-m", "hi", "-"]);
+    assert!(!both.status.success());
+    let both = String::from_utf8(both.stderr).unwrap();
+    assert!(both.contains("-m sets the note text"), "{both}");
+
+    let untouched = mori(dir.path(), &["status"]);
+    assert_ok(&untouched);
+    let untouched = String::from_utf8(untouched.stdout).unwrap();
+    assert!(untouched.contains("nothing staged"), "{untouched}");
+
+    assert_ok(&mori(
+        dir.path(),
+        &[
+            "note",
+            "-m",
+            "remember to check on-call docs before asking for escalation",
+            "--tag",
+            "oncall",
+        ],
+    ));
+    assert_ok(&mori(
+        dir.path(),
+        &[
+            "note",
+            "-m",
+            "also verify pagerduty routing",
+            "--session",
+            "procedures",
+            "--tag",
+            "oncall",
+        ],
+    ));
+
+    let piped = mori_stdin(
+        dir.path(),
+        &["note", "--tag", "oncall"],
+        "stdin reminder about the xylophone rotation\n\nsecond paragraph stays stored\n",
+    );
+    assert_ok(&piped);
+    let dashed = mori_stdin(
+        dir.path(),
+        &["note", "-", "--session", "procedures", "--tag", "oncall"],
+        "dash note about the rotation calendar\n",
+    );
+    assert_ok(&dashed);
+
+    let status = mori(dir.path(), &["status"]);
+    assert_ok(&status);
+    let status = String::from_utf8(status.stdout).unwrap();
+    assert!(
+        status.contains("remember to check on-call docs"),
+        "{status}"
+    );
+    assert!(status.contains("also verify pagerduty routing"), "{status}");
+    assert!(
+        status.contains("stdin reminder about the xylophone rotation"),
+        "{status}"
+    );
+    assert!(
+        status.contains("dash note about the rotation calendar"),
+        "{status}"
+    );
+    assert!(!status.contains("second paragraph"), "{status}");
+    assert!(status.contains("(main)"), "{status}");
+    assert!(status.contains("(procedures)"), "{status}");
+    assert!(status.contains("[oncall]"), "{status}");
+    assert_eq!(
+        status
+            .lines()
+            .filter(|line| line.contains("note") && line.contains("[oncall]"))
+            .count(),
+        4,
+        "{status}"
+    );
+
+    let commit = mori(dir.path(), &["commit", "-m", "oncall reminders"]);
+    assert_ok(&commit);
+    let commit = String::from_utf8(commit.stdout).unwrap();
+    assert!(commit.contains("note -  [oncall]"), "{commit}");
+    assert_eq!(commit.matches("note -  [oncall]").count(), 4, "{commit}");
+
+    let cleared = mori(dir.path(), &["status"]);
+    assert_ok(&cleared);
+    let cleared = String::from_utf8(cleared.stdout).unwrap();
+    assert!(cleared.contains("nothing staged"), "{cleared}");
+
+    let log = mori(dir.path(), &["log"]);
+    assert_ok(&log);
+    let log = String::from_utf8(log.stdout).unwrap();
+    assert!(log.contains("oncall reminders"), "{log}");
+    assert!(log.contains("remember to check on-call docs"), "{log}");
+    assert!(log.contains("also verify pagerduty routing"), "{log}");
+    assert!(
+        log.contains("stdin reminder about the xylophone rotation"),
+        "{log}"
+    );
+    assert!(
+        log.contains("dash note about the rotation calendar"),
+        "{log}"
+    );
+    assert!(log.contains("note -"), "{log}");
+    assert!(log.contains("tags: oncall"), "{log}");
+    assert!(!log.contains('§'), "{log}");
+    assert!(!log.contains('⊕'), "{log}");
+
+    let session = mori(
+        dir.path(),
+        &["recall", "pagerduty", "--session", "procedures"],
+    );
+    assert_ok(&session);
+    let session = String::from_utf8(session.stdout).unwrap();
+    assert!(session.contains("pagerduty"), "{session}");
+    assert!(!session.contains("on-call docs"), "{session}");
+    assert!(!session.contains('§'), "{session}");
+
+    let summary = mori(dir.path(), &["recall", "xylophone"]);
+    assert_ok(&summary);
+    let summary = String::from_utf8(summary.stdout).unwrap();
+    assert!(
+        summary.contains("stdin reminder about the xylophone rotation"),
+        "{summary}"
+    );
+    assert!(!summary.contains("second paragraph"), "{summary}");
+    assert!(!summary.contains('§'), "{summary}");
+
+    let full = mori(dir.path(), &["recall", "xylophone", "--full"]);
+    assert_ok(&full);
+    let full = String::from_utf8(full.stdout).unwrap();
+    assert!(full.contains("second paragraph stays stored"), "{full}");
 }

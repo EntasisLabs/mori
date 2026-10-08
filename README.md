@@ -67,6 +67,24 @@ mori show <commit> --raw
 
 `recall` ranks stored context against the query (8 hits by default). `find` filters without ranking. `log`, `status`, `recall`, and `find` print the summary. The STTP text stays in the store until you ask for it with `compile`, `show --raw`, or `recall --raw`.
 
+## Notes
+
+`note` stages a freeform thought with no file. Each note is one index entry (`kind` `note`) and stays there until `commit`. Later notes append.
+
+```bash
+mori note -m "remember to check on-call docs before asking for escalation" --tag oncall
+mori note -m "also verify pagerduty routing" --session procedures --tag oncall
+mori status
+mori commit -m "oncall reminders"
+```
+
+`--session` and `--tag` work the same way as `add`. Omit `-m` and pipe the text, or pass `-` to read stdin.
+
+```bash
+echo "verify the rotation calendar" | mori note --tag oncall
+mori note - --session procedures
+```
+
 ## Tags
 
 `--tag` is a facet on the context, separate from `--session`. Repeat it, or pass a comma-separated list. Tags are stored with the `document` and `source:` tags mori already writes. `recall` and `find` require every tag you pass.

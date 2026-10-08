@@ -1,3 +1,4 @@
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -85,6 +86,22 @@ enum Command {
         /// Default Locus session label stored on new context.
         #[arg(long, default_value = "main")]
         session: String,
+    },
+    /// Stage a freeform note. It stays in the index until commit.
+    ///
+    /// `-m` sets the text. A pipe, or `-`, reads stdin.
+    Note {
+        /// Pass `-` to read stdin.
+        #[arg(value_name = "-")]
+        stdin: Option<String>,
+        /// Note text.
+        #[arg(short, long, value_name = "TEXT")]
+        message: Option<String>,
+        /// Session label. Defaults to the repo session.
+        #[arg(long)]
+        session: Option<String>,
+        #[command(flatten)]
+        tags: TagArgs,
     },
     /// Stage a document, chat, note, or raw STTP file.
     Add {
@@ -217,6 +234,12 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init { path, session } => cmd_init(path, &session).await,
+        Command::Note {
+            stdin,
+            message,
+            session,
+            tags,
+        } => cmd_note(message, stdin.as_deref(), session, &tags.tag),
         Command::Add {
             sources,
             kind,
@@ -370,9 +393,91 @@ async fn cmd_status() -> Result<()> {
                 entry.session,
                 tags_suffix(&entry.tags)
             );
+            if entry.kind == ContextKind::Note {
+                let preview = note_preview(&entry.text);
+                if !preview.is_empty() {
+                    println!("    {preview}");
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn cmd_note(
+    message: Option<String>,
+    positional: Option<&str>,
+    session: Option<String>,
+    tags: &[String],
+) -> Result<()> {
+    let read_stdin = resolve_note_input(message.as_deref(), positional, io::stdin().is_terminal())?;
+    let tags = normalize_tags(tags)?;
+    let text = if read_stdin {
+        read_source("-")?
+    } else {
+        message.unwrap_or_default()
+    };
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        bail!("the note is empty");
+    }
+
+    let repo = repo_from_cwd()?;
+    let config = repo.load_config()?;
+    let session = session.unwrap_or(config.default_session);
+    let mut index = StageIndex::load(&repo)?;
+    index.upsert(StagedContext {
+        id: Uuid::new_v4().to_string(),
+        kind: ContextKind::Note,
+        session,
+        source: "-".to_string(),
+        text,
+        added_at: Utc::now(),
+        tags: tags.clone(),
+    });
+    index.save(&repo)?;
+    println!("staged note -{}", tags_suffix(&tags));
+    Ok(())
+}
+
+/// `true` when the note text comes from stdin.
+///
+/// `-m` wins when stdin is a pipe, so a script can pass the text as an argument.
+/// `-` forces stdin. A terminal with neither `-m` nor `-` has nothing to read.
+fn resolve_note_input(
+    message: Option<&str>,
+    positional: Option<&str>,
+    stdin_is_tty: bool,
+) -> Result<bool> {
+    match positional {
+        None => {}
+        Some("-") => {
+            if message.is_some() {
+                bail!("-m sets the note text; - reads stdin");
+            }
+            return Ok(true);
+        }
+        Some(other) => {
+            bail!("{other} is not a note; stage files with mori add");
+        }
+    }
+    if message.is_some() {
+        return Ok(false);
+    }
+    if stdin_is_tty {
+        bail!("a note needs -m, or text piped on stdin");
+    }
+    Ok(true)
+}
+
+fn note_preview(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(120).collect()
 }
 
 fn cmd_compile(
@@ -926,4 +1031,43 @@ fn repo_from_cwd() -> Result<Repo> {
 fn short(id: &str) -> &str {
     let end = id.chars().take(12).map(|ch| ch.len_utf8()).sum();
     &id[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_note_input;
+
+    #[test]
+    fn message_does_not_read_stdin() {
+        assert!(!resolve_note_input(Some("hi"), None, false).unwrap());
+        assert!(!resolve_note_input(Some("hi"), None, true).unwrap());
+    }
+
+    #[test]
+    fn pipe_without_message_reads_stdin() {
+        assert!(resolve_note_input(None, None, false).unwrap());
+    }
+
+    #[test]
+    fn tty_without_message_errors() {
+        let err = resolve_note_input(None, None, true).unwrap_err();
+        assert!(err.to_string().contains("-m"), "{err}");
+    }
+
+    #[test]
+    fn dash_reads_stdin_even_on_a_tty() {
+        assert!(resolve_note_input(None, Some("-"), true).unwrap());
+    }
+
+    #[test]
+    fn dash_and_message_conflict() {
+        let err = resolve_note_input(Some("hi"), Some("-"), false).unwrap_err();
+        assert!(err.to_string().contains("-m sets the note text"), "{err}");
+    }
+
+    #[test]
+    fn file_path_is_rejected() {
+        let err = resolve_note_input(None, Some("notes.md"), false).unwrap_err();
+        assert!(err.to_string().contains("mori add"), "{err}");
+    }
 }
